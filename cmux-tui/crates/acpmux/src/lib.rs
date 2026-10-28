@@ -67,6 +67,7 @@ pub mod live_models;
 pub mod local_stream;
 pub mod login_env;
 pub mod mailbox;
+pub mod mesh_control;
 pub mod model_copies;
 pub mod native;
 pub mod no_panic;
