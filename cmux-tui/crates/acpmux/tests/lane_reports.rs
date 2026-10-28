@@ -612,9 +612,22 @@ async fn a_held_session_message_reuses_its_delivery_id_when_the_pair_resumes() {
         .expect_err("second exchange is held");
     assert_eq!(held.data.as_ref().and_then(|d| d.get("held")), Some(&json!(true)));
 
+    let mut events = hub.subscribe();
     let resumed = hub.agent_pair_resume(&coord, None);
     assert_eq!(resumed["delivered"], 1, "{resumed}");
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.expect("message event");
+            if event.session_id == lane
+                && event.record.kind == "_acpmux/message"
+                && event.record.msg["messageId"] == "delivery-held"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("held message recorded in sender journal");
 
     let incoming = person.message_events(&coord).await;
     let outgoing = person.message_events(&lane).await;
