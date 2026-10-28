@@ -20,8 +20,8 @@ import Testing
             CGRect(x: parent.frame.minX, y: parent.frame.maxY - 60 - row * rowHeight, width: 200, height: rowHeight)
         }
 
-        func present(row: CGFloat, sliding: Bool) {
-            panel.present(body: body, anchor: anchor(row), placement: .beside, parent: parent, themeAnchor: nil,
+        func present(row: CGFloat, sliding: Bool, placement: HoverCardPlacement = .beside) {
+            panel.present(body: body, anchor: anchor(row), placement: placement, parent: parent, themeAnchor: nil,
                           sliding: sliding, applyTheme: {})
         }
 
@@ -52,6 +52,19 @@ import Testing
             body.heightAnchor.constraint(equalToConstant: 90),
         ])
         return Fixture(parent: parent, panel: HoverCardPanel(), body: body)
+    }
+
+    @Test func aSidebarCardFirstShowIsFullyVisibleAtRest() throws {
+        Motion.reduceMotionOverride = false
+        defer { Motion.reduceMotionOverride = nil }
+        let f = Self.fixture()
+        defer { f.tearDown() }
+
+        f.present(row: 0, sliding: false, placement: .besideRow)
+        #expect(f.panel.isVisible)
+        #expect(f.panel.alphaValue == 1, "the first frame must be fully visible after the dwell")
+        #expect(f.slideStart == nil, "the first frame must already be at its resting position")
+        #expect(CATransform3DIsIdentity(try #require(f.panel.contentView?.layer).sublayerTransform))
     }
 
     @Test func aFirstShowSlidesOutOfItsTargetAndARetargetSlidesTheCardOver() throws {
