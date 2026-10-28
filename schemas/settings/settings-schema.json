@@ -2165,7 +2165,7 @@
       },
       "help" : {
         "key" : "settings.window.titlebarButtons.help",
-        "text" : "On Hover hides Back and Forward until the pointer is over the top row. The sidebar button always shows."
+        "text" : "With the sidebar hidden, On Hover hides the sidebar button, Back and Forward until the pointer is over the top row. With the sidebar open, they always show."
       },
       "kept_on_reset_all" : false,
       "key" : "window.titlebarButtons",
@@ -23103,7 +23103,7 @@
       },
       "help" : {
         "key" : "settings.sidebar.controlsOnHover.help",
-        "text" : "The sidebar's New Workspace button, spaces, profile button and Search button show only while the pointer is over the sidebar. Off, they always show."
+        "text" : "The sidebar's New Workspace button, spaces, profile button and Search button, and the sidebar button, Back and Forward above it, show only while the pointer is over the sidebar. Off, they always show."
       },
       "kept_on_reset_all" : false,
       "key" : "sidebar.controlsOnHover",
