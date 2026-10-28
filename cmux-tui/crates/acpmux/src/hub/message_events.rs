@@ -176,6 +176,11 @@ pub(super) fn message_context(
     opts: &PromptOptions,
     prompt_id: &str,
 ) -> Option<MessageContext> {
+    // A person's multiplayer author also carries from/fromName. It is not a
+    // session sender and must never gain a session-to-session journal copy.
+    if crate::author::of_provenance(opts.provenance.as_ref()).is_some() {
+        return None;
+    }
     let raw = opts.message_sender.as_ref().or(opts.provenance.as_ref())?;
     let object = raw.as_object()?;
     let mut sender_session = object.get("sessionId").and_then(Value::as_str).map(str::to_owned);

@@ -420,6 +420,21 @@ async fn client_message_sender_metadata_cannot_forge_a_journal_copy() {
 
     assert!(person.message_events(&coord).await.is_empty());
     assert!(person.message_events(&lane).await.is_empty());
+
+    // A person author is provenance too, but cannot claim a local sender journal
+    // by choosing an id that happens to match a session's id.
+    person
+        .ok(
+            "session/prompt",
+            json!({
+                "sessionId": coord,
+                "prompt": [{"type": "text", "text": "a person's message"}],
+                "_meta": {"acpmux": {"author": {"id": lane, "name": "A person"}}}
+            }),
+        )
+        .await;
+    assert!(person.message_events(&coord).await.is_empty());
+    assert!(person.message_events(&lane).await.is_empty());
 }
 
 #[tokio::test]
