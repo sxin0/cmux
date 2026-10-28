@@ -422,6 +422,10 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 .as_str()
                 .and_then(|peer| session_id.strip_prefix(&format!("{peer}/")))
                 .unwrap_or(session_id);
+            // Keep the host-qualified route for every follow-up request. A peer may
+            // legitimately return the same raw id as a local session; using the raw id
+            // here would send prompts, info and lifecycle controls to the local chat.
+            let route_id = id.as_str();
             // Started past this host's lane cap: a warning, never a refusal (`hub/admission.rs`).
             if reused.is_none()
                 && let Some(w) =
@@ -461,7 +465,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 if let Some(text) = &first {
                     let prompt = PromptId::new(args.prompt_id.clone());
                     let accepted =
-                        queue_prompt(client, &session_id, text, false, None, &prompt).await?;
+                        queue_prompt(client, route_id, text, false, None, &prompt).await?;
                     if !json_out {
                         warn_host_pressure(&accepted);
                     }
@@ -489,7 +493,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
             let first = launch.first_prompt(&args, &v);
             if json_out && !one_shot {
                 let mut info = client
-                    .request(method::MUX_INFO, json!({"sessionId": session_id}))
+                    .request(method::MUX_INFO, json!({"sessionId": route_id}))
                     .await
                     .unwrap_or(v.clone());
                 if let Some(w) = v.pointer("/_meta/acpmux/worktree") {
@@ -515,7 +519,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 // Before it works: an allow it asks for is the app's alone.
                 if on_permission == OnPermission::Wait
                     && let Ok(info) =
-                        client.request(method::MUX_INFO, json!({"sessionId": session_id})).await
+                        client.request(method::MUX_INFO, json!({"sessionId": route_id})).await
                     && let Some(note) = crate::question_answer::app_allow_note(&info, &name)
                 {
                     eprintln!("{note}");
@@ -533,12 +537,12 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                     };
                     show();
                     let outcome =
-                        collect_reply(client.clone(), &session_id, &text, opts, &prompt).await;
+                        collect_reply(client.clone(), route_id, &text, opts, &prompt).await;
                     if ephemeral {
                         let _ = client
                             .request(
                                 method::MUX_KILL,
-                                json!({"sessionId": session_id, "purge": true}),
+                                json!({"sessionId": route_id, "purge": true}),
                             )
                             .await;
                     }
@@ -562,7 +566,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                     // The prompt is queued before the sidebar step, so a
                     // session never runs without its instructions.
                     let accepted =
-                        queue_prompt(client, &session_id, &text, false, None, &prompt).await?;
+                        queue_prompt(client, route_id, &text, false, None, &prompt).await?;
                     if !json_out {
                         warn_host_pressure(&accepted);
                     }
@@ -579,7 +583,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 show();
                 return stream_prompt(
                     client,
-                    &session_id,
+                    route_id,
                     &text,
                     false,
                     false,
@@ -594,7 +598,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
             if args.detach || json_out {
                 return Ok(());
             }
-            crate::tui::run(client, Some(session_id.to_owned())).await
+            crate::tui::run(client, Some(route_id.to_owned())).await
         }
         Command::Send {
             session,
