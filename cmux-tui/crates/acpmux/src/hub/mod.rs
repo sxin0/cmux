@@ -1078,7 +1078,9 @@ impl Hub {
         if ids.contains(&message_id) {
             return true;
         }
-        if self.append_at_locked(session, "mux", "_acpmux/message", msg, None, Some(at)).1 {
+        // The payload retains the acceptance time; the journal records when this
+        // copy was appended, so recovering an old message cannot regress activity.
+        if self.append_at_locked(session, "mux", "_acpmux/message", msg, None, None).1 {
             ids.insert(message_id);
             true
         } else {

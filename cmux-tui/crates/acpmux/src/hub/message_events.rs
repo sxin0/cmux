@@ -78,10 +78,14 @@ mod message_recovery_tests {
             json!({"promptId": "p-1", "turnId": "t-1", "text": "queued hello", "_meta": {"provenance": provenance}}),
         );
 
+        let sender_updated = sender.meta().updated_at;
+        let receiver_updated = receiver.meta().updated_at;
         recover_message_events(&hub, &receiver);
         recover_message_events(&hub, &receiver);
         assert_eq!(message_count(&hub, &receiver_id), 1);
         assert_eq!(message_count(&hub, &sender_id), 1);
+        assert!(sender.meta().updated_at >= sender_updated);
+        assert!(receiver.meta().updated_at >= receiver_updated);
     }
 }
 
