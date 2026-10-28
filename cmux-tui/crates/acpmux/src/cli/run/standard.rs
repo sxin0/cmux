@@ -456,7 +456,8 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                     .filter(|_| !lost_race && launch::never_prompted(info));
                 if let Some(text) = &first {
                     let prompt = PromptId::new(args.prompt_id.clone());
-                    let accepted = queue_prompt(client, &id, text, false, None, &prompt).await?;
+                    let accepted =
+                        queue_prompt(client, &session_id, text, false, None, &prompt).await?;
                     if !json_out {
                         warn_host_pressure(&accepted);
                     }
@@ -484,7 +485,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
             let first = launch.first_prompt(&args, &v);
             if json_out && !one_shot {
                 let mut info = client
-                    .request(method::MUX_INFO, json!({"sessionId": id}))
+                    .request(method::MUX_INFO, json!({"sessionId": session_id}))
                     .await
                     .unwrap_or(v.clone());
                 if let Some(w) = v.pointer("/_meta/acpmux/worktree") {
@@ -510,7 +511,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 // Before it works: an allow it asks for is the app's alone.
                 if on_permission == OnPermission::Wait
                     && let Ok(info) =
-                        client.request(method::MUX_INFO, json!({"sessionId": id})).await
+                        client.request(method::MUX_INFO, json!({"sessionId": session_id})).await
                     && let Some(note) = crate::question_answer::app_allow_note(&info, &name)
                 {
                     eprintln!("{note}");
@@ -527,10 +528,14 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                         steer: false,
                     };
                     show();
-                    let outcome = collect_reply(client.clone(), &id, &text, opts, &prompt).await;
+                    let outcome =
+                        collect_reply(client.clone(), &session_id, &text, opts, &prompt).await;
                     if ephemeral {
                         let _ = client
-                            .request(method::MUX_KILL, json!({"sessionId": id, "purge": true}))
+                            .request(
+                                method::MUX_KILL,
+                                json!({"sessionId": session_id, "purge": true}),
+                            )
                             .await;
                     }
                     let r = outcome?;
@@ -552,7 +557,8 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 if args.detach {
                     // The prompt is queued before the sidebar step, so a
                     // session never runs without its instructions.
-                    let accepted = queue_prompt(client, &id, &text, false, None, &prompt).await?;
+                    let accepted =
+                        queue_prompt(client, &session_id, &text, false, None, &prompt).await?;
                     if !json_out {
                         warn_host_pressure(&accepted);
                     }
@@ -569,7 +575,7 @@ pub(super) async fn run(cmd: Command, json_out: bool, suppress_reads: bool) -> R
                 show();
                 return stream_prompt(
                     client,
-                    &id,
+                    &session_id,
                     &text,
                     false,
                     false,
