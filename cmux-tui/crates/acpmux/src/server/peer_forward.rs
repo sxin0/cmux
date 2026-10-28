@@ -332,21 +332,34 @@ async fn forward_inner(
         } else {
             None
         };
+        let forward_intent = if let Some((sender_session, ..)) = &sender_message {
+            Some(super::outbox::remember_forward(hub, &peer.name, &id, sender_session, &p).await?)
+        } else {
+            None
+        };
         let token = accept.as_ref().map(|prompt_id| {
             let (conn, peer_name) = (conn.clone(), peer.name.clone());
             let callback_hub = hub.clone();
+            let sender_message = sender_message.clone();
+            let forward_intent = forward_intent.clone();
             hub.peer_accepts.wait(
                 &peer.name,
                 prompt_id,
                 Box::new(move |mut v| {
-                    if let Some((sender_session, sender, text, message_id)) = sender_message {
-                        callback_hub.append_sender_message_event(
-                            &sender_session,
-                            sender,
-                            text,
-                            message_id,
-                            crate::store::now_ms(),
-                        );
+                    let stored =
+                        if let Some((sender_session, sender, text, message_id)) = sender_message {
+                            callback_hub.append_sender_message_event(
+                                &sender_session,
+                                sender,
+                                text,
+                                message_id,
+                                crate::store::now_ms(),
+                            )
+                        } else {
+                            false
+                        };
+                    if let Some(intent) = forward_intent {
+                        super::outbox::forward_accepted(&callback_hub, &intent, v.clone(), stored);
                     }
                     if let Some(obj) = v.as_object_mut() {
                         obj.insert("peer".into(), Value::String(peer_name));
@@ -379,6 +392,28 @@ async fn forward_inner(
         } else {
             peer.request_on(m, p, on).await
         };
+        // Older peers can answer without a separate acceptance notification.
+        // Reconcile that successful result too, before the intent is settled.
+        if let Some(intent) = forward_intent.as_deref() {
+            match &result {
+                Ok(accepted) => {
+                    let stored =
+                        if let Some((sender_session, sender, text, message_id)) = sender_message {
+                            hub.append_sender_message_event(
+                                &sender_session,
+                                sender,
+                                text,
+                                message_id,
+                                crate::store::now_ms(),
+                            )
+                        } else {
+                            false
+                        };
+                    super::outbox::forward_accepted(hub, intent, accepted.clone(), stored);
+                }
+                Err(error) => super::outbox::forward_refused(hub, intent, error),
+            }
+        }
         if let (Some(prompt_id), Some(token)) = (&accept, token) {
             hub.peer_accepts.forget(&peer.name, prompt_id, token);
         }

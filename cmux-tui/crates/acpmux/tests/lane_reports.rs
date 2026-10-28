@@ -355,12 +355,15 @@ async fn session_message_without_prompt_id_records_both_journal_copies() {
     let lane = person.new_session("lane", json!({})).await;
     let mut from_lane = Client::as_session(&hub, &lane).await;
 
-    from_lane.prompt(&coord, "message without a client id").await;
+    let reply = from_lane
+        .ok("session/prompt", json!({"sessionId": coord, "prompt": [{"type": "text", "text": "message without a client id"}]}))
+        .await;
 
     let incoming = person.message_events(&coord).await;
     assert_eq!(incoming.len(), 1, "{incoming:#?}");
     assert_eq!(incoming[0]["sender"]["sessionId"], lane);
     assert!(!incoming[0]["messageId"].as_str().unwrap().is_empty());
+    assert_eq!(incoming[0]["messageId"], reply["_meta"]["acpmux"]["promptId"]);
     let outgoing = person.message_events(&lane).await;
     assert_eq!(outgoing.len(), 1, "{outgoing:#?}");
     assert_eq!(outgoing[0]["sender"]["sessionId"], lane);
@@ -435,6 +438,16 @@ async fn client_message_sender_metadata_cannot_forge_a_journal_copy() {
         .await;
     assert!(person.message_events(&coord).await.is_empty());
     assert!(person.message_events(&lane).await.is_empty());
+
+    // A shell's display-only sender name is not a session id.
+    person
+        .ok(
+            "session/prompt",
+            json!({"sessionId": coord,
+        "text": "named shell sender", "_meta": {"acpmux": {"fromAgent": "cli"}}}),
+        )
+        .await;
+    assert!(person.message_events(&coord).await.is_empty());
 }
 
 #[tokio::test]
@@ -548,6 +561,69 @@ async fn lane_report_a_report_the_pair_guard_holds_goes_in_once_on_resume_as_the
     hub.agent_pair_resume(&coord, None);
     let got = person.exactly(&coord, 1).await;
     assert_eq!(got[0]["_meta"]["provenance"]["from"], json!(lane), "{got:#?}");
+}
+
+#[tokio::test]
+async fn a_held_session_message_reuses_its_delivery_id_when_the_pair_resumes() {
+    let hub = hub();
+    hub.set_agent_pair_guard(acpmux::hub::PairGuard { max_messages: 1, ..Default::default() });
+    let mut person = Client::new(&hub);
+    let coord = person.new_session("coord", json!({})).await;
+    let lane = person.new_session("lane-held", json!({})).await;
+    let target = hub.resolve(&coord).unwrap();
+    let provenance = |text: &str| {
+        json!({
+            "kind": "session_message",
+            "from": lane.clone(),
+            "fromName": "lane-held",
+            "to": coord.clone(),
+            "text": text,
+        })
+    };
+
+    hub.prompt_with(
+        &target,
+        vec![json!({"type": "text", "text": "first"})],
+        "acpmux",
+        false,
+        acpmux::hub::PromptOptions {
+            prompt_id: Some("prompt-first".into()),
+            message_id: Some("delivery-first".into()),
+            provenance: Some(provenance("first")),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first exchange accepted");
+    let held = hub
+        .prompt_with(
+            &target,
+            vec![json!({"type": "text", "text": "held"})],
+            "acpmux",
+            false,
+            acpmux::hub::PromptOptions {
+                prompt_id: Some("prompt-held".into()),
+                message_id: Some("delivery-held".into()),
+                provenance: Some(provenance("held")),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("second exchange is held");
+    assert_eq!(held.data.as_ref().and_then(|d| d.get("held")), Some(&json!(true)));
+
+    let resumed = hub.agent_pair_resume(&coord, None);
+    assert_eq!(resumed["delivered"], 1, "{resumed}");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let incoming = person.message_events(&coord).await;
+    let outgoing = person.message_events(&lane).await;
+    let incoming: Vec<_> = incoming.iter().filter(|e| e["text"] == "held").collect();
+    let outgoing: Vec<_> = outgoing.iter().filter(|e| e["text"] == "held").collect();
+    assert_eq!(incoming.len(), 1, "{incoming:#?}");
+    assert_eq!(outgoing.len(), 1, "{outgoing:#?}");
+    assert_eq!(incoming[0]["messageId"], "delivery-held");
+    assert_eq!(outgoing[0]["messageId"], "delivery-held");
 }
 
 #[tokio::test]

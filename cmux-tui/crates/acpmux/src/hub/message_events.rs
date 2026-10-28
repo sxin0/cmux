@@ -133,6 +133,21 @@ pub(super) fn message_context_from_provenance(provenance: &Value) -> Option<Mess
     })
 }
 
+/// Restore delivery metadata from a durable queued or held prompt.
+///
+/// Callers pass either provenance already normalized by `message_context` before queueing, or a
+/// persisted prompt record. Raw RPC metadata must go through `message_context`, which validates
+/// the sender and chooses the current id.
+pub(super) fn restore_message_options(opts: &mut PromptOptions, provenance: Option<&Value>) {
+    let Some(message) = provenance.and_then(message_context_from_provenance) else { return };
+    if opts.message_id.is_none() {
+        opts.message_id = Some(message.message_id);
+    }
+    if !message.record_sender_copy && opts.message_sender.is_none() {
+        opts.message_sender = Some(message.sender);
+    }
+}
+
 /// Rebuild message projections that were not appended before a daemon stopped
 /// after persisting a prompt or queue record. The append path deduplicates by
 /// `messageId`, so this is safe to run on every log load.
@@ -202,7 +217,12 @@ pub(super) fn message_context(
             .and_then(Value::as_str)
             .map(|id| id.strip_prefix("acp:").unwrap_or(id).to_owned())
     })?;
-    if sender_session.is_empty() || name.is_empty() {
+    // A display-only --from name has no session identity. Its ordinary prompt
+    // provenance remains visible, but it cannot name a session journal copy.
+    if sender_session == crate::prompt_provenance::NAMED_SENDER
+        || sender_session.is_empty()
+        || name.is_empty()
+    {
         return None;
     }
     let sender = if let Some(sender) = opts.message_sender.as_ref() {

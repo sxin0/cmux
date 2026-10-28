@@ -22,7 +22,7 @@
 //! agent's step ends), so the forwarding daemon passes the peer's `_acpmux/prompt_accepted` on to
 //! the connection that sent the prompt as soon as it arrives ([`PeerAccepts`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 
@@ -77,7 +77,16 @@ impl Delivery {
         self.request.pointer("/_meta/acpmux/promptId").and_then(Value::as_str).unwrap_or_default()
     }
 
+    pub fn projection_only(&self) -> bool {
+        self.request.pointer("/_meta/acpmux/forwardProjection").is_some()
+    }
+
     pub fn settled(&self) -> bool {
+        // Projection intents stay in a legacy-terminal state on disk. An older
+        // daemon ignores them instead of executing a lookup as a prompt.
+        if self.projection_only() && self.state == State::Held {
+            return false;
+        }
         matches!(self.state, State::Delivered | State::Held | State::Failed)
     }
 
@@ -104,6 +113,8 @@ pub struct Outbox {
     path: StdMutex<Option<PathBuf>>,
     /// The last change on disk, held while a write runs.
     saved: StdMutex<u64>,
+    /// At most one bounded delivery/reconciliation task for each id in this launch.
+    running: StdMutex<HashSet<String>>,
     /// Fired on every change: a `send_status` that waits wakes.
     pub changed: Notify,
 }
@@ -162,9 +173,23 @@ impl Outbox {
 
     /// Records a new delivery; the same prompt id again answers with the first one.
     pub fn add(&self, delivery: Delivery) -> Delivery {
+        self.add_scoped(delivery, false)
+    }
+
+    /// A direct forward's recovery intent is scoped to its proven sender and target.
+    /// Independent sessions may legitimately use the same client prompt id.
+    pub fn remember_forward(&self, delivery: Delivery) -> Delivery {
+        self.add_scoped(delivery, true)
+    }
+
+    fn add_scoped(&self, delivery: Delivery, scoped: bool) -> Delivery {
         let mut book = self.book();
         let prompt_id = delivery.prompt_id().to_owned();
-        if let Some(first) = book.deliveries.values().find(|d| d.prompt_id() == prompt_id) {
+        if let Some(first) = book.deliveries.values().find(|d| {
+            d.prompt_id() == prompt_id
+                && d.request.pointer("/_meta/acpmux/forwardProjection").is_some() == scoped
+                && (!scoped || (d.caller == delivery.caller && d.target == delivery.target))
+        }) {
             let first = first.clone();
             // The first add may still be writing: answer once the file holds it too.
             let change = book.changes;
@@ -178,6 +203,14 @@ impl Outbox {
         self.save(change);
         self.changed.notify_waiters();
         delivery
+    }
+
+    pub fn start_delivery(&self, id: &str) -> bool {
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned())
+    }
+
+    pub fn end_delivery(&self, id: &str) {
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
     pub fn get(&self, id: &str) -> Option<Delivery> {
@@ -298,6 +331,14 @@ impl PeerAccepts {
 
     /// Peer `peer`'s `_acpmux/prompt_accepted` arrived: every forward of that id to it hears it.
     pub fn accepted(&self, peer: &str, params: &Value) {
+        // An in-flight duplicate may still be refused. Keep every hook until the
+        // original prompt reaches a real acceptance, rather than consuming them
+        // on this provisional duplicate notice.
+        if params.get("duplicate") == Some(&Value::Bool(true))
+            && params.get("turnId").is_none_or(Value::is_null)
+        {
+            return;
+        }
         let Some(prompt_id) = params.get("promptId").and_then(Value::as_str) else { return };
         let key = (peer.to_owned(), prompt_id.to_owned());
         let waits = self.hooks.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
@@ -331,6 +372,47 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn forward_intents_do_not_alias_other_senders_targets_or_queued_deliveries() {
+        let outbox = Outbox::default();
+        outbox.add(delivery(1));
+        let mut intent = delivery(1);
+        intent.id = "intent-1".into();
+        intent.caller = Some("sender".into());
+        intent.request["_meta"]["acpmux"]["forwardProjection"] = json!({"text": "hello"});
+        assert_eq!(outbox.remember_forward(intent.clone()).id, "intent-1");
+        intent.id = "unused-retry-id".into();
+        assert_eq!(outbox.remember_forward(intent.clone()).id, "intent-1");
+        intent.target = "another-target".into();
+        intent.id = "intent-2".into();
+        assert_eq!(outbox.remember_forward(intent.clone()).id, "intent-2");
+        intent.caller = Some("another-sender".into());
+        intent.id = "intent-3".into();
+        assert_eq!(outbox.remember_forward(intent).id, "intent-3");
+        assert_eq!(outbox.add(delivery(1)).id, "d-1");
+    }
+
+    #[test]
+    fn provisional_duplicate_does_not_consume_acceptance_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accepts = PeerAccepts::default();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let seen = seen.clone();
+            accepts.wait(
+                "peer",
+                "p1",
+                Box::new(move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
+        }
+        accepts.accepted("peer", &json!({"promptId": "p1", "duplicate": true, "turnId": null}));
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        accepts.accepted("peer", &json!({"promptId": "p1", "turnId": "t1"}));
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
     }
 
     /// Sends from many tasks at once share writes, and the file still holds every one of them

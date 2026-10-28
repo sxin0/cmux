@@ -148,6 +148,7 @@ impl Hub {
             // acceptance callback with a generated id without adding a prompt ledger
             // entry (the ledger is only for client-supplied idempotency keys).
             let generated_id = uuid::Uuid::now_v7().to_string();
+            opts.prompt_id = Some(generated_id.clone());
             ensure_message_provenance(&mut opts, &session.id);
             let message = message_context(self, session, &blocks, &opts, &generated_id);
             embed_message_context(&mut opts, message.as_ref());

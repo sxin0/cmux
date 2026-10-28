@@ -1043,7 +1043,7 @@ impl Hub {
         text: String,
         message_id: String,
         at: u64,
-    ) {
+    ) -> bool {
         let mut msg = json!({
             "sessionId": session.id.clone(),
             "sender": sender,
@@ -1070,16 +1070,19 @@ impl Hub {
                 })
             {
                 tracing::warn!(session = %session.id, %error, "cannot read message projection ids");
-                return;
+                return false;
             }
             *index = Some(ids);
         }
-        let Some(ids) = index.as_mut() else { return };
+        let Some(ids) = index.as_mut() else { return false };
         if ids.contains(&message_id) {
-            return;
+            return true;
         }
         if self.append_at_locked(session, "mux", "_acpmux/message", msg, None, Some(at)).1 {
             ids.insert(message_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -1091,11 +1094,13 @@ impl Hub {
         text: String,
         message_id: String,
         at: u64,
-    ) {
+    ) -> bool {
         if let Ok(session) = self.resolve(sender_session)
             && session.id == sender_session
         {
-            self.append_message_event(&session, sender, text, message_id, at);
+            self.append_message_event(&session, sender, text, message_id, at)
+        } else {
+            false
         }
     }
 
