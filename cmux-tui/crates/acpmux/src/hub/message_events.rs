@@ -141,6 +141,61 @@ mod message_recovery_tests {
         assert_eq!(message_count(&hub, &receiver_id), 1);
         assert_eq!(message_count(&hub, &sender_id), 1);
     }
+
+    #[tokio::test]
+    async fn sender_projection_repairs_without_resending_after_a_transient_failure() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_agent.py");
+        let mut config: Config = serde_json::from_value(json!({
+            "harnesses": {"fake": {"argv": ["python3", fake]}},
+            "defaultHarness": "fake",
+            "permissionPolicy": "approve-all"
+        }))
+        .expect("config");
+        config.store.mode = StoreMode::Memory;
+        let store = crate::store::open(&config.store, Path::new("/nonexistent")).expect("store");
+        let hub = Hub::new(config, store);
+        let make = |name: &str| NewRequest {
+            name: Some(name.into()),
+            cwd: Some(std::env::temp_dir()),
+            policy: Some(PermissionPolicy::ApproveAll),
+            ..NewRequest::default()
+        };
+        let sender = hub.new_session(make("sender")).await.expect("sender");
+        let receiver = hub.new_session(make("receiver")).await.expect("receiver");
+        let sender_id = sender.id.clone();
+        let receiver_id = receiver.id.clone();
+        let message = MessageContext {
+            sender: json!({"name": "sender", "sessionId": sender_id, "host": "local"}),
+            sender_session: sender.id.clone(),
+            text: "repair me".into(),
+            message_id: "repair-delivery-1".into(),
+            at: 1234,
+            record_sender_copy: true,
+        };
+
+        // Inject one sender-store failure. The bounded repair retries the same projection without
+        // invoking prompt delivery.
+        hub.message_projection_failures.lock().unwrap().insert(sender.id.clone());
+        let mut events = hub.subscribe();
+        record_message_context(&hub, &receiver_id, &message);
+        assert_eq!(message_count(&hub, &receiver_id), 1);
+        assert_eq!(message_count(&hub, &sender_id), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let event = events.recv().await.expect("hub event");
+                if event.session_id == sender_id
+                    && event.record.kind == "_acpmux/message"
+                    && event.record.msg["messageId"] == "repair-delivery-1"
+                    && message_count(&hub, &sender_id) == 1
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("sender projection repair timed out");
+        assert_eq!(message_count(&hub, &sender_id), 1);
+    }
 }
 
 /// Internal durable copy of a message projection. It lives beside the existing
@@ -209,7 +264,7 @@ pub(super) fn restore_message_options(opts: &mut PromptOptions, provenance: Opti
 /// Rebuild message projections that were not appended before a daemon stopped
 /// after persisting a prompt or queue record. The append path deduplicates by
 /// `messageId`, so this is safe to run on every log load.
-pub(super) fn recover_message_events(hub: &Hub, session: &Arc<Session>) {
+pub(super) fn recover_message_events(hub: &Arc<Hub>, session: &Arc<Session>) {
     let mut pending = Vec::new();
     let kinds = ["queued", "user_message"];
     let _ = hub.store.scan_kinds(&session.id, &kinds, &mut |record| {
@@ -218,24 +273,9 @@ pub(super) fn recover_message_events(hub: &Hub, session: &Arc<Session>) {
         true
     });
     for message in pending {
-        hub.append_message_event(
-            session,
-            message.sender.clone(),
-            message.text.clone(),
-            message.message_id.clone(),
-            message.at,
-        );
-        if message.record_sender_copy
-            && message.sender_session != session.id
-            && let Some(sender) = resolve_exact(hub, &message.sender_session)
-        {
-            hub.append_message_event(
-                &sender,
-                message.sender,
-                message.text,
-                message.message_id,
-                message.at,
-            );
+        append_or_repair(hub, &session.id, &message);
+        if message.record_sender_copy && message.sender_session != session.id {
+            append_or_repair(hub, &message.sender_session, &message);
         }
     }
 }
@@ -328,26 +368,73 @@ pub(super) fn ensure_message_provenance(opts: &mut PromptOptions, target_id: &st
     opts.provenance = Some(provenance);
 }
 
-pub(super) fn record_message_context(hub: &Hub, target_session: &str, message: &MessageContext) {
-    if let Some(target) = resolve_exact(hub, target_session) {
-        hub.append_message_event(
-            &target,
-            message.sender.clone(),
-            message.text.clone(),
-            message.message_id.clone(),
-            message.at,
-        );
+pub(super) fn record_message_context(
+    hub: &Arc<Hub>,
+    target_session: &str,
+    message: &MessageContext,
+) {
+    append_or_repair(hub, target_session, message);
+    if message.record_sender_copy && message.sender_session != target_session {
+        append_or_repair(hub, &message.sender_session, message);
     }
-    if message.record_sender_copy
-        && message.sender_session != target_session
-        && let Some(sender) = resolve_exact(hub, &message.sender_session)
-    {
-        hub.append_message_event(
-            &sender,
-            message.sender.clone(),
-            message.text.clone(),
-            message.message_id.clone(),
-            message.at,
-        );
+}
+
+fn append_or_repair(hub: &Arc<Hub>, session_id: &str, message: &MessageContext) {
+    let Some(session) = resolve_exact(hub, session_id) else { return };
+    if !hub.append_message_event(
+        &session,
+        message.sender.clone(),
+        message.text.clone(),
+        message.message_id.clone(),
+        message.at,
+    ) {
+        schedule_projection_repair(hub, session_id, message);
+    }
+}
+
+fn schedule_projection_repair(hub: &Arc<Hub>, session_id: &str, message: &MessageContext) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let key = (session_id.to_owned(), message.message_id.clone());
+    let inserted =
+        hub.message_repairs.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone());
+    if !inserted {
+        return;
+    }
+    let sender = message.sender.clone();
+    let text = message.text.clone();
+    let message_id = message.message_id.clone();
+    let at = message.at;
+    let hub = hub.clone();
+    let guard = ProjectionRepairGuard { hub: hub.clone(), key: key.clone() };
+    tokio::spawn(async move {
+        // Constructed before spawning so cancellation before the future is first polled still
+        // removes the in-flight key.
+        let _guard = guard;
+        for delay in super::outbox::RETRY_DELAYS_SECS {
+            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+            let Some(session) = resolve_exact(&hub, &key.0) else { return };
+            if hub.append_message_event(
+                &session,
+                sender.clone(),
+                text.clone(),
+                message_id.clone(),
+                at,
+            ) {
+                return;
+            }
+        }
+    });
+}
+
+struct ProjectionRepairGuard {
+    hub: Arc<Hub>,
+    key: (String, String),
+}
+
+impl Drop for ProjectionRepairGuard {
+    fn drop(&mut self) {
+        self.hub.message_repairs.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
     }
 }

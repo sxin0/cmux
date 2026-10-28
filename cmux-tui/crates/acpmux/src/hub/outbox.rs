@@ -35,6 +35,9 @@ use crate::rpc::RpcError;
 /// How long a delivered or failed message stays readable by `send --status`.
 pub const KEEP_SETTLED_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Shared bounded retry schedule for delivery and projection-only reconciliation.
+pub(crate) const RETRY_DELAYS_SECS: &[u64] = &[2, 5, 10, 30, 60, 120, 300, 600, 900];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -299,27 +302,34 @@ pub fn keep_attachments(path: &Path, request: &Value) -> anyhow::Result<()> {
 }
 
 type AcceptHook = Box<dyn FnOnce(Value) + Send>;
+type ProvisionalHook = std::sync::Arc<dyn Fn(Value) + Send + Sync>;
 
 /// Prompts forwarded to a peer that wait for the peer's acceptance, by peer, target session and prompt id. Two
 /// forwards of one id (a retry while the first still waits) each get theirs.
 #[derive(Default)]
 pub struct PeerAccepts {
-    hooks: StdMutex<HashMap<(String, String, String), Vec<(u64, AcceptHook)>>>,
+    hooks: StdMutex<HashMap<(String, String, String), Vec<(u64, AcceptHook, ProvisionalHook)>>>,
     next: std::sync::atomic::AtomicU64,
 }
 
 impl PeerAccepts {
     /// Calls `hook` with peer `peer`'s `_acpmux/prompt_accepted` for `prompt_id`, once. Returns
     /// the wait's token for [`Self::forget`].
-    pub fn wait(&self, peer: &str, session_id: &str, prompt_id: &str, hook: AcceptHook) -> u64 {
+    pub fn wait(
+        &self,
+        peer: &str,
+        session_id: &str,
+        prompt_id: &str,
+        hook: AcceptHook,
+        provisional: ProvisionalHook,
+    ) -> u64 {
         let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let key = (peer.to_owned(), session_id.to_owned(), prompt_id.to_owned());
-        self.hooks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_default()
-            .push((token, hook));
+        self.hooks.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().push((
+            token,
+            hook,
+            provisional,
+        ));
         token
     }
 
@@ -328,7 +338,7 @@ impl PeerAccepts {
         let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
         let key = (peer.to_owned(), session_id.to_owned(), prompt_id.to_owned());
         if let Some(waits) = hooks.get_mut(&key) {
-            waits.retain(|(t, _)| *t != token);
+            waits.retain(|(t, _, _)| *t != token);
             if waits.is_empty() {
                 hooks.remove(&key);
             }
@@ -337,19 +347,31 @@ impl PeerAccepts {
 
     /// Peer `peer`'s `_acpmux/prompt_accepted` arrived: every forward of that id to it hears it.
     pub fn accepted(&self, peer: &str, params: &Value) {
-        // An in-flight duplicate may still be refused. Keep every hook until the
-        // original prompt reaches a real acceptance, rather than consuming them
-        // on this provisional duplicate notice.
-        if params.get("duplicate") == Some(&Value::Bool(true))
-            && params.get("turnId").is_none_or(Value::is_null)
-        {
-            return;
-        }
         let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else { return };
         let Some(prompt_id) = params.get("promptId").and_then(Value::as_str) else { return };
         let key = (peer.to_owned(), session_id.to_owned(), prompt_id.to_owned());
+        // Preserve a retry's early acknowledgement, including a retry registered
+        // after the real acceptance. A provisional notice cannot persist or settle
+        // a projection: the original may still be refused. Keep final hooks intact.
+        if params.get("duplicate") == Some(&Value::Bool(true))
+            && params.get("turnId").is_none_or(Value::is_null)
+        {
+            let callbacks: Vec<_> = self
+                .hooks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|(_, _, hook)| hook.clone())
+                .collect();
+            for callback in callbacks {
+                callback(params.clone());
+            }
+            return;
+        }
         let waits = self.hooks.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-        for (_, hook) in waits.into_iter().flatten() {
+        for (_, hook, _) in waits.into_iter().flatten() {
             hook(params.clone());
         }
     }
@@ -406,7 +428,9 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let accepts = PeerAccepts::default();
         let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let provisional = std::sync::Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
+            let provisional = provisional.clone();
             let seen = seen.clone();
             accepts.wait(
                 "peer",
@@ -415,6 +439,9 @@ mod tests {
                 Box::new(move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                 }),
+                std::sync::Arc::new(move |_| {
+                    provisional.fetch_add(1, Ordering::SeqCst);
+                }),
             );
         }
         accepts.accepted(
@@ -422,8 +449,33 @@ mod tests {
             &json!({"sessionId": "target", "promptId": "p1", "duplicate": true, "turnId": null}),
         );
         assert_eq!(seen.load(Ordering::SeqCst), 0);
+        assert_eq!(provisional.load(Ordering::SeqCst), 2);
         accepts.accepted("peer", &json!({"sessionId": "target", "promptId": "p1", "turnId": "t1"}));
         assert_eq!(seen.load(Ordering::SeqCst), 2);
+
+        // A retry registered after the original acknowledgement still hears its
+        // provisional acknowledgement while the original turn remains busy.
+        let seen_late = seen.clone();
+        let provisional_late = provisional.clone();
+        let token = accepts.wait(
+            "peer",
+            "target",
+            "p1",
+            Box::new(move |_| {
+                seen_late.fetch_add(1, Ordering::SeqCst);
+            }),
+            std::sync::Arc::new(move |_| {
+                provisional_late.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        accepts.accepted(
+            "peer",
+            &json!({"sessionId": "target", "promptId": "p1", "duplicate": true, "turnId": null}),
+        );
+        assert_eq!(provisional.load(Ordering::SeqCst), 3);
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        accepts.forget("peer", "target", "p1", token);
+        assert!(accepts.hooks.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -439,6 +491,7 @@ mod tests {
                 Box::new(move |_| {
                     seen.lock().unwrap().push(target);
                 }),
+                std::sync::Arc::new(|_| {}),
             );
         }
         accepts.accepted(

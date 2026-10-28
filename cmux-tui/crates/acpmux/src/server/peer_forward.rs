@@ -342,6 +342,7 @@ async fn forward_inner(
             let callback_hub = hub.clone();
             let sender_message = sender_message.clone();
             let forward_intent = forward_intent.clone();
+            let (provisional_conn, provisional_peer) = (conn.clone(), peer_name.clone());
             hub.peer_accepts.wait(
                 &peer.name,
                 &id,
@@ -366,6 +367,12 @@ async fn forward_inner(
                         obj.insert("peer".into(), Value::String(peer_name));
                     }
                     conn.send(&Message::notification(method::MUX_PROMPT_ACCEPTED, v));
+                }),
+                Arc::new(move |mut v| {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("peer".into(), Value::String(provisional_peer.clone()));
+                    }
+                    provisional_conn.send(&Message::notification(method::MUX_PROMPT_ACCEPTED, v));
                 }),
             )
         });

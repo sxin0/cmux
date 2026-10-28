@@ -21,7 +21,7 @@ use crate::no_panic::JsonExt;
 use std::time::Duration;
 
 use super::*;
-use crate::hub::outbox::{Delivery, State};
+use crate::hub::outbox::{Delivery, RETRY_DELAYS_SECS, State};
 
 /// What an attempt that did not deliver leaves the delivery as.
 #[derive(Debug, PartialEq)]
@@ -37,7 +37,6 @@ enum Next {
 /// How long one attempt waits for the target's acceptance.
 const ATTEMPT_WAIT: Duration = Duration::from_secs(120);
 /// The waits before each attempt after the first: about 34 minutes in all, then it fails.
-const RETRY_DELAYS_SECS: &[u64] = &[2, 5, 10, 30, 60, 120, 300, 600, 900];
 /// The longest a `send_status` waits for a delivery to settle.
 const MAX_STATUS_WAIT_MS: u64 = 10_000;
 
