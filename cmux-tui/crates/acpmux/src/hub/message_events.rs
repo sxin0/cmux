@@ -1,0 +1,257 @@
+//! Durable message projections, repaired from accepted prompt records after a restart.
+
+use super::*;
+
+#[derive(Clone)]
+pub(super) struct MessageContext {
+    sender: Value,
+    sender_session: String,
+    text: String,
+    message_id: String,
+    at: u64,
+    /// A peer daemon owns the sender-side journal copy. Its forwarded metadata
+    /// is for the receiver projection only, even if the ids happen to resolve
+    /// locally after a move.
+    record_sender_copy: bool,
+}
+
+#[cfg(test)]
+mod message_recovery_tests {
+    use super::*;
+    use crate::config::{Config, PermissionPolicy, StoreMode};
+    use crate::hub::NewRequest;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn message_count(hub: &Hub, id: &str) -> usize {
+        let filter = EventFilter::parse(None).expect("event filter");
+        hub.events_page(id, 0, None, 500, None, false, &filter)
+            .expect("event page")
+            .events
+            .into_iter()
+            .filter(|record| record.kind == "_acpmux/message")
+            .count()
+    }
+
+    /// A queued prompt can be durable before its acceptance callback runs. A
+    /// later log load reconstructs both projections and remains idempotent.
+    #[tokio::test]
+    async fn queued_message_recovery_rebuilds_both_journals_once() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_agent.py");
+        let mut config: Config = serde_json::from_value(json!({
+            "harnesses": {"fake": {"argv": ["python3", fake]}},
+            "defaultHarness": "fake",
+            "permissionPolicy": "approve-all"
+        }))
+        .expect("config");
+        config.store.mode = StoreMode::Memory;
+        let store = crate::store::open(&config.store, Path::new("/nonexistent")).expect("store");
+        let hub = Hub::new(config, store);
+        let make = |name: &str| NewRequest {
+            harness: Some("fake".into()),
+            name: Some(name.into()),
+            cwd: Some(std::env::temp_dir()),
+            policy: Some(PermissionPolicy::ApproveAll),
+            ..NewRequest::default()
+        };
+        let sender = hub.new_session(make("sender")).await.expect("sender");
+        let receiver = hub.new_session(make("receiver")).await.expect("receiver");
+        let sender_id = sender.id.clone();
+        let receiver_id = receiver.id.clone();
+        let provenance = json!({
+            "kind": "session_message",
+            "from": sender_id,
+            "fromName": "sender",
+            "to": receiver_id,
+            "_acpmuxMessage": {
+                "sender": {"name": "sender", "sessionId": sender.id, "host": "local"},
+                "text": "queued hello",
+                "messageId": "delivery-1",
+                "at": 1234,
+                "recordSenderCopy": true
+            }
+        });
+        hub.append(
+            &receiver,
+            "mux",
+            "queued",
+            json!({"promptId": "p-1", "turnId": "t-1", "text": "queued hello", "_meta": {"provenance": provenance}}),
+        );
+
+        recover_message_events(&hub, &receiver);
+        recover_message_events(&hub, &receiver);
+        assert_eq!(message_count(&hub, &receiver_id), 1);
+        assert_eq!(message_count(&hub, &sender_id), 1);
+    }
+}
+
+/// Internal durable copy of a message projection. It lives beside the existing
+/// provenance on queued/user_message records so a daemon restart can recover a
+/// projection even if it crashed after writing the prompt record but before the
+/// acceptance callback ran.
+const MESSAGE_META: &str = "_acpmuxMessage";
+
+pub(super) fn embed_message_context(opts: &mut PromptOptions, message: Option<&MessageContext>) {
+    let Some(provenance) = opts.provenance.as_mut() else { return };
+    let Some(object) = provenance.as_object_mut() else { return };
+    object.remove(MESSAGE_META);
+    let Some(message) = message else { return };
+    object.insert(
+        MESSAGE_META.to_owned(),
+        json!({
+            "sender": message.sender.clone(),
+            "text": message.text.clone(),
+            "messageId": message.message_id.clone(),
+            "recordSenderCopy": message.record_sender_copy,
+            "at": message.at,
+        }),
+    );
+}
+
+fn resolve_exact(hub: &Hub, id: &str) -> Option<Arc<Session>> {
+    hub.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+}
+
+pub(super) fn message_context_from_provenance(provenance: &Value) -> Option<MessageContext> {
+    let object = provenance.get(MESSAGE_META)?.as_object()?;
+    let sender = object.get("sender")?.clone();
+    let sender_object = sender.as_object()?;
+    let sender_session = sender_object.get("sessionId")?.as_str()?.to_owned();
+    let text = object.get("text")?.as_str()?.to_owned();
+    let message_id = object.get("messageId")?.as_str()?.to_owned();
+    let at = object.get("at").and_then(Value::as_u64).unwrap_or_else(crate::store::now_ms);
+    Some(MessageContext {
+        sender,
+        sender_session,
+        text,
+        message_id,
+        at,
+        record_sender_copy: object
+            .get("recordSenderCopy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Rebuild message projections that were not appended before a daemon stopped
+/// after persisting a prompt or queue record. The append path deduplicates by
+/// `messageId`, so this is safe to run on every log load.
+pub(super) fn recover_message_events(hub: &Hub, session: &Arc<Session>) {
+    let mut pending = Vec::new();
+    let kinds = ["queued", "user_message"];
+    let _ = hub.store.scan_kinds(&session.id, &kinds, &mut |record| {
+        let Some(provenance) = record.msg.pointer("/_meta/provenance") else { return true };
+        if let Some(message) = message_context_from_provenance(provenance) {
+            pending.push(message);
+        }
+        true
+    });
+    for message in pending {
+        hub.append_message_event(
+            session,
+            message.sender.clone(),
+            message.text.clone(),
+            message.message_id.clone(),
+            message.at,
+        );
+        if message.record_sender_copy
+            && message.sender_session != session.id
+            && let Some(sender) = resolve_exact(hub, &message.sender_session)
+        {
+            hub.append_message_event(
+                &sender,
+                message.sender,
+                message.text,
+                message.message_id,
+                message.at,
+            );
+        }
+    }
+}
+
+pub(super) fn message_context(
+    hub: &Hub,
+    _session: &Session,
+    blocks: &[Value],
+    opts: &PromptOptions,
+    prompt_id: &str,
+) -> Option<MessageContext> {
+    let raw = opts.message_sender.as_ref().or(opts.provenance.as_ref())?;
+    let object = raw.as_object()?;
+    let mut sender_session = object.get("sessionId").and_then(Value::as_str).map(str::to_owned);
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("fromName").and_then(Value::as_str))
+        .or_else(|| opts.agent.as_deref())
+        .map(str::to_owned)
+        .or_else(|| {
+            let from = object.get("from").and_then(Value::as_str)?;
+            let id = from.strip_prefix("acp:").unwrap_or(from);
+            sender_session = Some(id.to_owned());
+            Some(hub.session_name(id))
+        })?;
+    let sender_session = sender_session.or_else(|| {
+        object
+            .get("from")
+            .and_then(Value::as_str)
+            .map(|id| id.strip_prefix("acp:").unwrap_or(id).to_owned())
+    })?;
+    if sender_session.is_empty() || name.is_empty() {
+        return None;
+    }
+    let sender = if let Some(sender) = opts.message_sender.as_ref() {
+        sender.clone()
+    } else {
+        json!({"name": name, "sessionId": sender_session, "host": host_label()})
+    };
+    let message_id = opts
+        .message_id
+        .clone()
+        .or_else(|| object.get("msgId").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| prompt_id.to_owned());
+    Some(MessageContext {
+        sender,
+        sender_session,
+        text: prompt_text(blocks),
+        message_id,
+        at: crate::store::now_ms(),
+        record_sender_copy: opts.message_sender.is_none(),
+    })
+}
+
+pub(super) fn ensure_message_provenance(opts: &mut PromptOptions, target_id: &str) {
+    if opts.provenance.is_some() {
+        return;
+    }
+    let Some(sender) = opts.message_sender.as_ref().and_then(Value::as_object) else { return };
+    let Some(id) = sender.get("sessionId").and_then(Value::as_str) else { return };
+    let Some(name) = sender.get("name").and_then(Value::as_str) else { return };
+    let mut provenance = crate::prompt_provenance::named_sender(name, target_id);
+    provenance["sessionId"] = json!(id);
+    opts.provenance = Some(provenance);
+}
+
+pub(super) fn record_message_context(hub: &Hub, target_session: &str, message: &MessageContext) {
+    if let Some(target) = resolve_exact(hub, target_session) {
+        hub.append_message_event(
+            &target,
+            message.sender.clone(),
+            message.text.clone(),
+            message.message_id.clone(),
+            message.at,
+        );
+    }
+    if message.record_sender_copy
+        && message.sender_session != target_session
+        && let Some(sender) = resolve_exact(hub, &message.sender_session)
+    {
+        hub.append_message_event(
+            &sender,
+            message.sender.clone(),
+            message.text.clone(),
+            message.message_id.clone(),
+            message.at,
+        );
+    }
+}

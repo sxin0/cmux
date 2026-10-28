@@ -4,80 +4,9 @@ use super::exit_reason::explains_exit;
 use super::*;
 use std::sync::atomic::Ordering;
 
-#[derive(Clone)]
-struct MessageContext {
-    sender: Value,
-    sender_session: String,
-    text: String,
-    message_id: String,
-}
-
-fn message_context(
-    hub: &Hub,
-    _session: &Session,
-    blocks: &[Value],
-    opts: &PromptOptions,
-    prompt_id: &str,
-) -> Option<MessageContext> {
-    let raw = opts.message_sender.as_ref().or(opts.provenance.as_ref())?;
-    let object = raw.as_object()?;
-    let mut sender_session = object.get("sessionId").and_then(Value::as_str).map(str::to_owned);
-    let name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .or_else(|| object.get("fromName").and_then(Value::as_str))
-        .or_else(|| opts.agent.as_deref())
-        .or_else(|| {
-            let from = object.get("from").and_then(Value::as_str)?;
-            let id = from.strip_prefix("acp:").unwrap_or(from);
-            sender_session = Some(id.to_owned());
-            Some(hub.session_name(id))
-        })?;
-    let sender_session = sender_session.or_else(|| {
-        object
-            .get("from")
-            .and_then(Value::as_str)
-            .map(|id| id.strip_prefix("acp:").unwrap_or(id).to_owned())
-    })?;
-    if sender_session.is_empty() || name.is_empty() {
-        return None;
-    }
-    let sender = if let Some(sender) = opts.message_sender.as_ref() {
-        sender.clone()
-    } else {
-        json!({"name": name, "sessionId": sender_session, "host": host_label()})
-    };
-    let message_id = opts
-        .message_id
-        .clone()
-        .or_else(|| object.get("msgId").and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| prompt_id.to_owned());
-    Some(MessageContext { sender, sender_session, text: prompt_text(blocks), message_id })
-}
-
-fn record_message_context(hub: &Hub, target_session: &str, message: &MessageContext) {
-    let at = crate::store::now_ms();
-    if let Ok(target) = hub.resolve(target_session) {
-        hub.append_message_event(
-            &target,
-            message.sender.clone(),
-            message.text.clone(),
-            message.message_id.clone(),
-            at,
-        );
-    }
-    if message.sender_session != target_session
-        && let Ok(sender) = hub.resolve(&message.sender_session)
-    {
-        hub.append_message_event(
-            &sender,
-            message.sender.clone(),
-            message.text.clone(),
-            message.message_id.clone(),
-            at,
-        );
-    }
-}
+use super::message_events::{
+    embed_message_context, ensure_message_provenance, message_context, record_message_context,
+};
 
 /// What the agent of `session` is sent for `blocks`: model-sized copies of its large images
 /// (`model_copies.rs`), then [`acp_prompt_blocks`]. No copy is made, or kept, for a turn a remote
@@ -219,7 +148,9 @@ impl Hub {
             // acceptance callback with a generated id without adding a prompt ledger
             // entry (the ledger is only for client-supplied idempotency keys).
             let generated_id = uuid::Uuid::now_v7().to_string();
+            ensure_message_provenance(&mut opts, &session.id);
             let message = message_context(self, session, &blocks, &opts, &generated_id);
+            embed_message_context(&mut opts, message.as_ref());
             let target_id = session.id.clone();
             let hub = self.clone();
             let prior = opts.on_accepted.take();
@@ -278,7 +209,9 @@ impl Hub {
         // sends and automatic lane reports, both of which can call `prompt_with` without passing
         // through the RPC request handler. A duplicate or a refused prompt never records a new
         // event.
+        ensure_message_provenance(&mut opts, &session.id);
         let message = message_context(self, session, &blocks, &opts, &prompt_id);
+        embed_message_context(&mut opts, message.as_ref());
         // Remember the outcome only for a prompt that reached the session:
         // one refused before that (no agent, a bad session) may be sent again.
         let accepted = Arc::new(AtomicBool::new(false));

@@ -1190,11 +1190,16 @@ async fn dispatch_request(
             // name arbitrary `_meta` fields, but sender identity is stamped by the
             // proven caller/provenance below; accepting it here would let a client
             // forge durable message records in another session's journal.
-            let message_sender = (conn.origin == super::Origin::Peer)
+            let message_sender = (conn.origin == super::Origin::Peer && !web)
                 .then(|| mux_meta(&params).and_then(|m| m.get("messageSender")))
                 .flatten()
-                .filter(|sender| sender.is_object())
-                .cloned();
+                .and_then(|sender| {
+                    let sender: crate::protocol::MessageSender =
+                        serde_json::from_value(sender.clone()).ok()?;
+                    (!sender.name.is_empty() && !sender.session_id.is_empty())
+                        .then(|| serde_json::to_value(sender).ok())
+                        .flatten()
+                });
             let on_accepted = Some(composer::on_accepted(hub, conn, &s, &params)?);
             // A key replaces its sender's queued prompts (`supersede.rs`), which knows agents and
             // the owner only: a person's prompt neither replaces nor is replaced.

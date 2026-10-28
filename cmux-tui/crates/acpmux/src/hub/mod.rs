@@ -9,6 +9,7 @@ pub(crate) mod admission;
 mod adopted_fences;
 mod adoption;
 mod agent_pairs;
+mod message_events;
 pub use agent_pairs::PairGuard;
 mod aside;
 pub(crate) mod auto_resume;
@@ -904,6 +905,7 @@ impl Hub {
             harness_use: RwLock::new(()),
             idle_refusal_logged: AtomicU64::new(0),
             append_lock: StdMutex::new(()),
+            message_ids: StdMutex::new(None),
             loading: AtomicBool::new(false),
             replaying: StdMutex::new(Vec::new()),
             caught_up: AtomicBool::new(true),
@@ -1054,21 +1056,31 @@ impl Hub {
         self.catch_up_locked(session);
         // A forwarded delivery can be accepted more than once while a caller retries
         // the same id.  Keep one projection per delivery id in the durable journal,
-        // including after a daemon restart.  The append lock makes the scan and append
-        // one operation for concurrent acceptances.
-        let mut duplicate = false;
-        let _ = self.store.scan_kinds(&session.id, &["_acpmux/message"], &mut |record| {
-            if record.msg.get("messageId") == msg.get("messageId") {
-                duplicate = true;
-                false
-            } else {
-                true
+        // including after a daemon restart. Load the id index once, not once per
+        // message or recovered record. The append lock serializes check and append.
+        let mut index = session.message_ids.lock().unwrap_or_else(|e| e.into_inner());
+        if index.is_none() {
+            let mut ids = std::collections::HashSet::new();
+            if let Err(error) =
+                self.store.scan_kinds(&session.id, &["_acpmux/message"], &mut |record| {
+                    if let Some(id) = record.msg.get("messageId").and_then(Value::as_str) {
+                        ids.insert(id.to_owned());
+                    }
+                    true
+                })
+            {
+                tracing::warn!(session = %session.id, %error, "cannot read message projection ids");
+                return;
             }
-        });
-        if duplicate {
+            *index = Some(ids);
+        }
+        let Some(ids) = index.as_mut() else { return };
+        if ids.contains(&message_id) {
             return;
         }
-        self.append_at_locked(session, "mux", "_acpmux/message", msg, None, Some(at));
+        if self.append_at_locked(session, "mux", "_acpmux/message", msg, None, Some(at)).1 {
+            ids.insert(message_id);
+        }
     }
 
     /// Record the sender-side copy when a prompt is accepted by a remote daemon.
@@ -1080,7 +1092,9 @@ impl Hub {
         message_id: String,
         at: u64,
     ) {
-        if let Ok(session) = self.resolve(sender_session) {
+        if let Ok(session) = self.resolve(sender_session)
+            && session.id == sender_session
+        {
             self.append_message_event(&session, sender, text, message_id, at);
         }
     }

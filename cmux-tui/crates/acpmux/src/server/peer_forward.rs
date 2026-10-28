@@ -80,13 +80,11 @@ const SESSION_SCOPED_EXCLUDED: &[&str] = &[
 /// report as the person's (claude-sr2, 2026-10-24: every remote lane's report a plain bubble), and
 /// a keyed prompt could replace another sender's (`hub/supersede.rs`). The person names no one.
 fn name_sender(hub: &Arc<Hub>, conn: &Arc<Conn>, p: &mut Value) {
+    // This field is daemon-authored, even when a caller already supplied fromAgent.
+    if let Some(meta) = p.pointer_mut("/_meta/acpmux").and_then(Value::as_object_mut) {
+        meta.remove("messageSender");
+    }
     if conn.is_person() {
-        // A Web/person request has no proven session sender.  Never relay a
-        // client-supplied identity to a peer where it would be trusted as a
-        // daemon-stamped sender projection.
-        if let Some(meta) = p.pointer_mut("/_meta/acpmux").and_then(Value::as_object_mut) {
-            meta.remove("messageSender");
-        }
         return;
     }
     let Some(caller) = conn.caller() else { return };
@@ -307,7 +305,7 @@ async fn forward_inner(
             .then(|| p.pointer("/_meta/acpmux/promptId").and_then(Value::as_str))
             .flatten()
             .map(str::to_owned);
-        let sender_message = if m == method::SESSION_PROMPT {
+        let sender_message = if m == method::SESSION_PROMPT && !conn.is_person() {
             conn.caller().map(|sender_session| {
                 let sender =
                     p.pointer("/_meta/acpmux/messageSender").cloned().unwrap_or_else(|| {
@@ -320,7 +318,8 @@ async fn forward_inner(
                 let text = p
                     .get("prompt")
                     .and_then(Value::as_array)
-                    .map(crate::hub::prompt_text)
+                    .map(|blocks| crate::hub::prompt_text(blocks))
+                    .or_else(|| p.get("text").and_then(Value::as_str).map(str::to_owned))
                     .unwrap_or_default();
                 let message_id = p
                     .pointer("/_meta/acpmux/messageId")

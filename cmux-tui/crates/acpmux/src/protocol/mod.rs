@@ -65,7 +65,7 @@ impl Kind {
 pub struct ProtocolParams {}
 
 /// The sender and receiver projection of a persisted session-to-session message.
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageEvent {
     pub at: u64,
@@ -75,7 +75,7 @@ pub struct MessageEvent {
     pub text: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageSender {
     #[serde(skip_serializing_if = "Option::is_none")]
