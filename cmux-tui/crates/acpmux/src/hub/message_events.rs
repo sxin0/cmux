@@ -15,6 +15,7 @@ pub(super) struct MessageContext {
     record_sender_copy: bool,
 }
 
+#[cfg_attr(test, allow(clippy::items_after_test_module))]
 #[cfg(test)]
 mod message_recovery_tests {
     use super::*;
@@ -314,14 +315,15 @@ pub(super) fn message_context(
         .get("name")
         .and_then(Value::as_str)
         .or_else(|| object.get("fromName").and_then(Value::as_str))
-        .or_else(|| opts.agent.as_deref())
+        .or(opts.agent.as_deref())
         .map(str::to_owned)
         .or_else(|| {
             let from = object.get("from").and_then(Value::as_str)?;
             let id = from.strip_prefix("acp:").unwrap_or(from);
             sender_session = Some(id.to_owned());
             Some(hub.session_name(id))
-        })?;
+        })
+        .or_else(|| opts.agent.as_deref().map(str::to_owned))?;
     let sender_session = sender_session.or_else(|| {
         object
             .get("from")

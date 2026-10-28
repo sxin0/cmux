@@ -16,19 +16,19 @@ pub fn redact_message_hosts(v: &mut Value) -> bool {
             }
         }
         Value::Object(map) => {
-            if map.get("kind").and_then(Value::as_str) == Some("_acpmux/message") {
-                if let Some(sender) = map
+            if map.get("kind").and_then(Value::as_str) == Some("_acpmux/message")
+                && let Some(sender) = map
                     .get_mut("msg")
                     .and_then(|msg| msg.get_mut("sender"))
                     .and_then(Value::as_object_mut)
-                {
-                    changed |= sender.remove("host").is_some();
-                }
+            {
+                changed |= sender.remove("host").is_some();
             }
-            if map.get("messageId").is_some() && map.get("sender").is_some() {
-                if let Some(sender) = map.get_mut("sender").and_then(Value::as_object_mut) {
-                    changed |= sender.remove("host").is_some();
-                }
+            if map.get("messageId").is_some()
+                && map.get("sender").is_some()
+                && let Some(sender) = map.get_mut("sender").and_then(Value::as_object_mut)
+            {
+                changed |= sender.remove("host").is_some();
             }
             for child in map.values_mut() {
                 changed |= redact_message_hosts(child);
@@ -39,6 +39,7 @@ pub fn redact_message_hosts(v: &mut Value) -> bool {
     changed
 }
 
+#[cfg_attr(test, allow(clippy::items_after_test_module))]
 #[cfg(test)]
 mod tests {
     use super::redact_message_hosts;
