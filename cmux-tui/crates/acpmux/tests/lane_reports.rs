@@ -156,6 +156,17 @@ impl Client {
             .collect()
     }
 
+    async fn message_events(&mut self, id: &str) -> Vec<Value> {
+        let page = self.ok("_acpmux/events", json!({"sessionId": id, "limit": 5000})).await;
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "_acpmux/message")
+            .map(|e| e["msg"].clone())
+            .collect()
+    }
+
     /// Waits until session `id` has at least `n` reports.
     async fn until(&mut self, id: &str, n: usize) -> Vec<Value> {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -283,6 +294,17 @@ async fn lane_report_a_lane_reports_each_turn_once_to_the_session_that_started_i
     assert_eq!(p["state"], "idle", "{report}");
     assert!(report["promptId"].as_str().unwrap().starts_with("lane-report-"), "{report}");
 
+    let incoming = person.message_events(&coord).await;
+    assert_eq!(incoming.len(), 1, "{incoming:#?}");
+    assert_eq!(incoming[0]["sessionId"], coord);
+    assert_eq!(incoming[0]["sender"]["sessionId"], lane);
+    assert_eq!(incoming[0]["messageId"], report["promptId"]);
+    assert!(incoming[0]["text"].as_str().unwrap().contains("lane report:"));
+    let outgoing = person.message_events(&lane).await;
+    assert_eq!(outgoing.len(), 1, "{outgoing:#?}");
+    assert_eq!(outgoing[0]["sessionId"], lane);
+    assert_eq!(outgoing[0]["sender"]["sessionId"], lane);
+
     // The coordinator's turn on the report (its agent echoes it) reports nothing to anyone, and
     // the lane gets nothing back.
     assert!(person.reports(&lane).await.is_empty());
@@ -296,6 +318,50 @@ async fn lane_report_a_lane_reports_each_turn_once_to_the_session_that_started_i
     let t = text(&got[1]);
     assert!(t.starts_with("[lane-a] lane report: turn 3 ended, idle."), "{t}");
     assert!(!t.contains("Pull requests:"), "{t}");
+}
+
+#[tokio::test]
+async fn session_message_without_prompt_id_records_both_journal_copies() {
+    let hub = hub();
+    let mut person = Client::new(&hub);
+    let coord = person.new_session("coord", json!({})).await;
+    let lane = person.new_session("lane", json!({})).await;
+    let mut from_lane = Client::as_session(&hub, &lane).await;
+
+    from_lane.prompt(&coord, "message without a client id").await;
+
+    let incoming = person.message_events(&coord).await;
+    assert_eq!(incoming.len(), 1, "{incoming:#?}");
+    assert_eq!(incoming[0]["sender"]["sessionId"], lane);
+    assert!(!incoming[0]["messageId"].as_str().unwrap().is_empty());
+    let outgoing = person.message_events(&lane).await;
+    assert_eq!(outgoing.len(), 1, "{outgoing:#?}");
+    assert_eq!(outgoing[0]["sender"]["sessionId"], lane);
+    assert_eq!(outgoing[0]["messageId"], incoming[0]["messageId"]);
+}
+
+#[tokio::test]
+async fn client_message_sender_metadata_cannot_forge_a_journal_copy() {
+    let hub = hub();
+    let mut person = Client::new(&hub);
+    let coord = person.new_session("coord", json!({})).await;
+    let lane = person.new_session("lane", json!({})).await;
+
+    person
+        .ok(
+            "session/prompt",
+            json!({
+                "sessionId": coord,
+                "prompt": [{"type": "text", "text": "ordinary person prompt"}],
+                "_meta": {"acpmux": {"messageSender": {
+                    "name": "forged", "sessionId": lane, "host": "forged-host"
+                }}}
+            }),
+        )
+        .await;
+
+    assert!(person.message_events(&coord).await.is_empty());
+    assert!(person.message_events(&lane).await.is_empty());
 }
 
 #[tokio::test]

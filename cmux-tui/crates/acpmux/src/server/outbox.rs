@@ -85,8 +85,12 @@ pub(super) async fn handle(
         mux.insert("promptId".into(), json!(uuid::Uuid::now_v7().to_string()));
     }
     let now = crate::store::now_ms();
+    let delivery_id = uuid::Uuid::now_v7().to_string();
+    if let Some(mux) = request.pointer_mut("/_meta/acpmux").and_then(Value::as_object_mut) {
+        mux.insert("messageId".into(), Value::String(delivery_id.clone()));
+    }
     let new = Delivery {
-        id: uuid::Uuid::now_v7().to_string(),
+        id: delivery_id,
         target,
         request,
         caller: conn.caller().filter(|_| !conn.is_person()).map(str::to_owned),

@@ -4,6 +4,81 @@ use super::exit_reason::explains_exit;
 use super::*;
 use std::sync::atomic::Ordering;
 
+#[derive(Clone)]
+struct MessageContext {
+    sender: Value,
+    sender_session: String,
+    text: String,
+    message_id: String,
+}
+
+fn message_context(
+    hub: &Hub,
+    _session: &Session,
+    blocks: &[Value],
+    opts: &PromptOptions,
+    prompt_id: &str,
+) -> Option<MessageContext> {
+    let raw = opts.message_sender.as_ref().or(opts.provenance.as_ref())?;
+    let object = raw.as_object()?;
+    let mut sender_session = object.get("sessionId").and_then(Value::as_str).map(str::to_owned);
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("fromName").and_then(Value::as_str))
+        .or_else(|| opts.agent.as_deref())
+        .or_else(|| {
+            let from = object.get("from").and_then(Value::as_str)?;
+            let id = from.strip_prefix("acp:").unwrap_or(from);
+            sender_session = Some(id.to_owned());
+            Some(hub.session_name(id))
+        })?;
+    let sender_session = sender_session.or_else(|| {
+        object
+            .get("from")
+            .and_then(Value::as_str)
+            .map(|id| id.strip_prefix("acp:").unwrap_or(id).to_owned())
+    })?;
+    if sender_session.is_empty() || name.is_empty() {
+        return None;
+    }
+    let sender = if let Some(sender) = opts.message_sender.as_ref() {
+        sender.clone()
+    } else {
+        json!({"name": name, "sessionId": sender_session, "host": host_label()})
+    };
+    let message_id = opts
+        .message_id
+        .clone()
+        .or_else(|| object.get("msgId").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| prompt_id.to_owned());
+    Some(MessageContext { sender, sender_session, text: prompt_text(blocks), message_id })
+}
+
+fn record_message_context(hub: &Hub, target_session: &str, message: &MessageContext) {
+    let at = crate::store::now_ms();
+    if let Ok(target) = hub.resolve(target_session) {
+        hub.append_message_event(
+            &target,
+            message.sender.clone(),
+            message.text.clone(),
+            message.message_id.clone(),
+            at,
+        );
+    }
+    if message.sender_session != target_session
+        && let Ok(sender) = hub.resolve(&message.sender_session)
+    {
+        hub.append_message_event(
+            &sender,
+            message.sender.clone(),
+            message.text.clone(),
+            message.message_id.clone(),
+            at,
+        );
+    }
+}
+
 /// What the agent of `session` is sent for `blocks`: model-sized copies of its large images
 /// (`model_copies.rs`), then [`acp_prompt_blocks`]. No copy is made, or kept, for a turn a remote
 /// device controls: it is read from this machine's disk as the prompt's sender, who was local.
@@ -139,6 +214,23 @@ impl Hub {
         self.session_log(session).await;
         self.pair_logs(opts.provenance.as_ref()).await;
         let Some(prompt_id) = opts.prompt_id.clone() else {
+            // `session/prompt` accepts prompts without a client id.  They still need a
+            // durable message id when they came from another session, so wrap the
+            // acceptance callback with a generated id without adding a prompt ledger
+            // entry (the ledger is only for client-supplied idempotency keys).
+            let generated_id = uuid::Uuid::now_v7().to_string();
+            let message = message_context(self, session, &blocks, &opts, &generated_id);
+            let target_id = session.id.clone();
+            let hub = self.clone();
+            let prior = opts.on_accepted.take();
+            opts.on_accepted = Some(Box::new(move |v| {
+                if let Some(message) = message.as_ref() {
+                    record_message_context(&hub, &target_id, message);
+                }
+                if let Some(prior) = prior {
+                    prior(v);
+                }
+            }));
             return self.prompt_unless_held(session, blocks, client, steer, opts).await;
         };
         let duplicate = |v: Value| json!({"sessionId": session.id, "promptId": prompt_id, "duplicate": true, "queued": false, "turnId": v.pointer("/_meta/acpmux/turnId")});
@@ -182,18 +274,35 @@ impl Hub {
             prompt_ledger::prune(&mut ledger);
             return Ok(logged);
         }
+        // Message events are acknowledged at the same point as the prompt. This covers direct
+        // sends and automatic lane reports, both of which can call `prompt_with` without passing
+        // through the RPC request handler. A duplicate or a refused prompt never records a new
+        // event.
+        let message = message_context(self, session, &blocks, &opts, &prompt_id);
         // Remember the outcome only for a prompt that reached the session:
         // one refused before that (no agent, a bad session) may be sent again.
         let accepted = Arc::new(AtomicBool::new(false));
         if let Some(f) = opts.on_accepted.take() {
             let accepted = accepted.clone();
+            let hub = self.clone();
+            let target_id = session.id.clone();
             opts.on_accepted = Some(Box::new(move |v| {
                 accepted.store(true, Ordering::SeqCst);
+                if let Some(message) = message.as_ref() {
+                    record_message_context(&hub, &target_id, message);
+                }
                 f(v);
             }));
         } else {
             let accepted = accepted.clone();
-            opts.on_accepted = Some(Box::new(move |_| accepted.store(true, Ordering::SeqCst)));
+            let hub = self.clone();
+            let target_id = session.id.clone();
+            opts.on_accepted = Some(Box::new(move |_| {
+                accepted.store(true, Ordering::SeqCst);
+                if let Some(message) = message.as_ref() {
+                    record_message_context(&hub, &target_id, message);
+                }
+            }));
         }
         let result = self.prompt_unless_held(session, blocks, client, steer, opts).await;
         let mut ledger = session.prompts.lock().unwrap();

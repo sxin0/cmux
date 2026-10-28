@@ -292,6 +292,9 @@ pub struct TurnInfo {
 pub struct PromptOptions {
     /// Client-chosen id (`_meta.acpmux.promptId`); generated when absent.
     pub prompt_id: Option<String>,
+    /// The delivery id for a message sent through `_acpmux/send_queue`; direct prompts use the
+    /// prompt id when no separate delivery id exists.
+    pub message_id: Option<String>,
     /// Called once, as soon as the prompt is recorded (queued or started),
     /// with `{sessionId, promptId, turnId, queued, position?, steer?}`, or
     /// `{sessionId, promptId, duplicate: true}` for a prompt id seen before.
@@ -326,6 +329,9 @@ pub struct PromptOptions {
     pub interrupt_turn: Option<String>,
     /// Who sent the prompt, when not the person (`prompt_provenance.rs`).
     pub provenance: Option<Value>,
+    /// Sender identity carried across a peer link. Provenance is intentionally removed at that
+    /// boundary, but the additive message event still needs the sender's stable identity.
+    pub message_sender: Option<Value>,
     /// Another agent's name when it sent the prompt with no provenance: the session a
     /// connection proved it runs in, or `_meta.acpmux.fromAgent` (`digest.rs`).
     pub agent: Option<String>,
@@ -1026,6 +1032,59 @@ impl Hub {
         self.append_with_host_seq(session, dir, kind, msg, None)
     }
 
+    /// Persist one session-to-session message projection. The journal containing the copy is
+    /// named by `session`; the payload keeps that id too so clients can route a replayed event.
+    pub(super) fn append_message_event(
+        &self,
+        session: &Session,
+        sender: Value,
+        text: String,
+        message_id: String,
+        at: u64,
+    ) {
+        let mut msg = json!({
+            "sessionId": session.id.clone(),
+            "sender": sender,
+            "text": text,
+            "at": at,
+            "messageId": message_id,
+        });
+        tool_paths::add_canonical_paths(session, "_acpmux/message", &mut msg);
+        let _order = session.append_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.catch_up_locked(session);
+        // A forwarded delivery can be accepted more than once while a caller retries
+        // the same id.  Keep one projection per delivery id in the durable journal,
+        // including after a daemon restart.  The append lock makes the scan and append
+        // one operation for concurrent acceptances.
+        let mut duplicate = false;
+        let _ = self.store.scan_kinds(&session.id, &["_acpmux/message"], &mut |record| {
+            if record.msg.get("messageId") == msg.get("messageId") {
+                duplicate = true;
+                false
+            } else {
+                true
+            }
+        });
+        if duplicate {
+            return;
+        }
+        self.append_at_locked(session, "mux", "_acpmux/message", msg, None, Some(at));
+    }
+
+    /// Record the sender-side copy when a prompt is accepted by a remote daemon.
+    pub(super) fn append_sender_message_event(
+        &self,
+        sender_session: &str,
+        sender: Value,
+        text: String,
+        message_id: String,
+        at: u64,
+    ) {
+        if let Ok(session) = self.resolve(sender_session) {
+            self.append_message_event(&session, sender, text, message_id, at);
+        }
+    }
+
     /// Append one record; `host_seq` names the agent host entry it logs.
     pub(super) fn append_with_host_seq(
         &self,
@@ -1067,6 +1126,18 @@ impl Hub {
         tool_paths::add_canonical_paths(session, kind, &mut msg);
         let _order = session.append_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.catch_up_locked(session);
+        self.append_at_locked(session, dir, kind, msg, host_seq, at)
+    }
+
+    fn append_at_locked(
+        &self,
+        session: &Session,
+        dir: &str,
+        kind: &str,
+        msg: Value,
+        host_seq: Option<u64>,
+        at: Option<u64>,
+    ) -> (EventRecord, bool) {
         let seq = session.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let at = at.unwrap_or_else(now_ms);
         let record = EventRecord { seq, at, dir: dir.into(), kind: kind.into(), msg, host_seq };

@@ -46,6 +46,7 @@ pub const CAPABILITIES: &[Capability] = &[
             method::MUX_WATCH,
             method::MUX_EVENTS,
             method::MUX_EVENT,
+            method::MUX_MESSAGE,
             "_acpmux/lagged",
             method::MUX_SESSION_CHANGED,
             method::MUX_PROMPT_ACCEPTED,

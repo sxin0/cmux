@@ -81,12 +81,29 @@ const SESSION_SCOPED_EXCLUDED: &[&str] = &[
 /// a keyed prompt could replace another sender's (`hub/supersede.rs`). The person names no one.
 fn name_sender(hub: &Arc<Hub>, conn: &Arc<Conn>, p: &mut Value) {
     if conn.is_person() {
+        // A Web/person request has no proven session sender.  Never relay a
+        // client-supplied identity to a peer where it would be trusted as a
+        // daemon-stamped sender projection.
+        if let Some(meta) = p.pointer_mut("/_meta/acpmux").and_then(Value::as_object_mut) {
+            meta.remove("messageSender");
+        }
         return;
     }
     let Some(caller) = conn.caller() else { return };
+    let mut meta = json!({
+        "messageSender": {
+            "name": hub.session_name(caller),
+            "sessionId": caller,
+            "host": crate::hub::host_label(),
+        },
+    });
     if p.pointer("/_meta/acpmux/fromAgent").is_none_or(Value::is_null) {
-        crate::hub::merge_mux_meta(p, json!({"fromAgent": hub.session_name(caller)}));
+        meta["fromAgent"] = json!(hub.session_name(caller));
     }
+    // Always replace a client-provided sender identity with the session proven by
+    // this connection.  `fromAgent` remains caller-declared for display, but it
+    // cannot alter the durable message sender.
+    crate::hub::merge_mux_meta(p, meta);
 }
 
 /// `e` with `data.peer` = `peer`, this daemon's own name for the peer that
@@ -270,18 +287,68 @@ async fn forward_inner(
                 }
             }
         }
+        // A prompt without a client id still needs an acceptance key so the sender-side
+        // journal copy can be recorded when the peer accepts it.  The generated id is
+        // internal to this forwarded request and is not exposed as a client id.
+        if m == method::SESSION_PROMPT
+            && p.pointer("/_meta/acpmux/promptId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .is_none()
+        {
+            crate::hub::merge_mux_meta(
+                &mut p,
+                json!({"promptId": uuid::Uuid::now_v7().to_string()}),
+            );
+        }
         // The peer answers a prompt when its turn (or a steer's step) ends; the client hears
         // the peer's acceptance as soon as it comes (`hub/outbox.rs` `PeerAccepts`).
         let accept = (m == method::SESSION_PROMPT)
             .then(|| p.pointer("/_meta/acpmux/promptId").and_then(Value::as_str))
             .flatten()
             .map(str::to_owned);
+        let sender_message = if m == method::SESSION_PROMPT {
+            conn.caller().map(|sender_session| {
+                let sender =
+                    p.pointer("/_meta/acpmux/messageSender").cloned().unwrap_or_else(|| {
+                        json!({
+                            "name": hub.session_name(sender_session),
+                            "sessionId": sender_session,
+                            "host": crate::hub::host_label(),
+                        })
+                    });
+                let text = p
+                    .get("prompt")
+                    .and_then(Value::as_array)
+                    .map(crate::hub::prompt_text)
+                    .unwrap_or_default();
+                let message_id = p
+                    .pointer("/_meta/acpmux/messageId")
+                    .and_then(Value::as_str)
+                    .or_else(|| p.pointer("/_meta/acpmux/promptId").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_owned();
+                (sender_session.to_owned(), sender, text, message_id)
+            })
+        } else {
+            None
+        };
         let token = accept.as_ref().map(|prompt_id| {
             let (conn, peer_name) = (conn.clone(), peer.name.clone());
+            let hub = hub.clone();
             hub.peer_accepts.wait(
                 &peer.name,
                 prompt_id,
                 Box::new(move |mut v| {
+                    if let Some((sender_session, sender, text, message_id)) = sender_message {
+                        hub.append_sender_message_event(
+                            &sender_session,
+                            sender,
+                            text,
+                            message_id,
+                            crate::store::now_ms(),
+                        );
+                    }
                     if let Some(obj) = v.as_object_mut() {
                         obj.insert("peer".into(), Value::String(peer_name));
                     }

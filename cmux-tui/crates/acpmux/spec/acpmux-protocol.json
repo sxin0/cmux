@@ -1431,6 +1431,13 @@
     },
     {
       "kind": "notification",
+      "name": "_acpmux/message",
+      "params": {
+        "$ref": "#/types/MessageEvent"
+      }
+    },
+    {
+      "kind": "notification",
       "name": "_acpmux/session_changed",
       "params": {
         "$ref": "#/types/SessionChanged"
@@ -4015,6 +4022,27 @@
         "toolsMutable",
         "pending"
       ],
+      "type": "object"
+    },
+    "MessageEvent": {
+      "description": "A persisted message copy in a sender or receiver session journal.",
+      "properties": {
+        "at": {"format": "uint64", "minimum": 0, "type": "integer"},
+        "messageId": {"type": "string"},
+        "sender": {"$ref": "#/types/MessageSender"},
+        "sessionId": {"type": "string"},
+        "text": {"type": "string"}
+      },
+      "required": ["at", "messageId", "sender", "sessionId", "text"],
+      "type": "object"
+    },
+    "MessageSender": {
+      "properties": {
+        "host": {"type": ["string", "null"]},
+        "name": {"type": "string"},
+        "sessionId": {"type": "string"}
+      },
+      "required": ["name", "sessionId"],
       "type": "object"
     },
     "SessionEvent": {
