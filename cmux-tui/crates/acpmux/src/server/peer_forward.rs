@@ -334,13 +334,13 @@ async fn forward_inner(
         };
         let token = accept.as_ref().map(|prompt_id| {
             let (conn, peer_name) = (conn.clone(), peer.name.clone());
-            let hub = hub.clone();
+            let callback_hub = hub.clone();
             hub.peer_accepts.wait(
                 &peer.name,
                 prompt_id,
                 Box::new(move |mut v| {
                     if let Some((sender_session, sender, text, message_id)) = sender_message {
-                        hub.append_sender_message_event(
+                        callback_hub.append_sender_message_event(
                             &sender_session,
                             sender,
                             text,
