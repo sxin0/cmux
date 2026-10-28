@@ -173,16 +173,24 @@ impl Outbox {
 
     /// Records a new delivery; the same prompt id again answers with the first one.
     pub fn add(&self, delivery: Delivery) -> Delivery {
-        self.add_scoped(delivery, false)
+        let (delivery, change) = self.add_scoped(delivery, false);
+        self.save(change);
+        self.changed.notify_waiters();
+        delivery
     }
 
     /// A direct forward's recovery intent is scoped to its proven sender and target.
     /// Independent sessions may legitimately use the same client prompt id.
-    pub fn remember_forward(&self, delivery: Delivery) -> Delivery {
-        self.add_scoped(delivery, true)
+    /// Unlike ordinary queued deliveries, a forward must not proceed when this
+    /// write fails: no later retry can recreate its intent after a restart.
+    pub fn remember_forward(&self, delivery: Delivery) -> anyhow::Result<Delivery> {
+        let (delivery, change) = self.add_scoped(delivery, true);
+        self.save_checked(change)?;
+        self.changed.notify_waiters();
+        Ok(delivery)
     }
 
-    fn add_scoped(&self, delivery: Delivery, scoped: bool) -> Delivery {
+    fn add_scoped(&self, delivery: Delivery, scoped: bool) -> (Delivery, u64) {
         let mut book = self.book();
         let prompt_id = delivery.prompt_id().to_owned();
         if let Some(first) = book.deliveries.values().find(|d| {
@@ -193,16 +201,11 @@ impl Outbox {
             let first = first.clone();
             // The first add may still be writing: answer once the file holds it too.
             let change = book.changes;
-            drop(book);
-            self.save(change);
-            return first;
+            return (first, change);
         }
         book.deliveries.insert(delivery.id.clone(), delivery.clone());
         let change = book.changed();
-        drop(book);
-        self.save(change);
-        self.changed.notify_waiters();
-        delivery
+        (delivery, change)
     }
 
     pub fn start_delivery(&self, id: &str) -> bool {
@@ -234,12 +237,18 @@ impl Outbox {
     /// that started after the change covers it, so changes made while one write runs share the
     /// next.
     fn save(&self, change: u64) {
+        if let Err(e) = self.save_checked(change) {
+            tracing::warn!("outbox: could not save: {e:#}");
+        }
+    }
+
+    fn save_checked(&self, change: u64) -> anyhow::Result<()> {
         let Some(path) = self.path.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
-            return;
+            return Ok(());
         };
         let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
         if *saved >= change {
-            return;
+            return Ok(());
         }
         let (bytes, newest) = {
             let book = self.book();
@@ -260,14 +269,11 @@ impl Outbox {
                 .collect();
             (serde_json::to_vec(&on_disk), book.changes)
         };
-        let written = bytes
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| crate::config::write_atomic(&path, &bytes));
-        match written {
-            Ok(()) => *saved = newest,
-            // Not marked saved: the next change writes again.
-            Err(e) => tracing::warn!("outbox: could not save {}: {e:#}", path.display()),
-        }
+        // Failed writes never advance saved. A retry of the same in-memory intent
+        // must try the write again before it can report success.
+        crate::config::write_atomic(&path, &bytes?)?;
+        *saved = newest;
+        Ok(())
     }
 }
 
@@ -294,20 +300,20 @@ pub fn keep_attachments(path: &Path, request: &Value) -> anyhow::Result<()> {
 
 type AcceptHook = Box<dyn FnOnce(Value) + Send>;
 
-/// Prompts forwarded to a peer that wait for the peer's acceptance, by peer and prompt id. Two
+/// Prompts forwarded to a peer that wait for the peer's acceptance, by peer, target session and prompt id. Two
 /// forwards of one id (a retry while the first still waits) each get theirs.
 #[derive(Default)]
 pub struct PeerAccepts {
-    hooks: StdMutex<HashMap<(String, String), Vec<(u64, AcceptHook)>>>,
+    hooks: StdMutex<HashMap<(String, String, String), Vec<(u64, AcceptHook)>>>,
     next: std::sync::atomic::AtomicU64,
 }
 
 impl PeerAccepts {
     /// Calls `hook` with peer `peer`'s `_acpmux/prompt_accepted` for `prompt_id`, once. Returns
     /// the wait's token for [`Self::forget`].
-    pub fn wait(&self, peer: &str, prompt_id: &str, hook: AcceptHook) -> u64 {
+    pub fn wait(&self, peer: &str, session_id: &str, prompt_id: &str, hook: AcceptHook) -> u64 {
         let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let key = (peer.to_owned(), prompt_id.to_owned());
+        let key = (peer.to_owned(), session_id.to_owned(), prompt_id.to_owned());
         self.hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -318,9 +324,9 @@ impl PeerAccepts {
     }
 
     /// The forwarded prompt answered: this wait no longer listens.
-    pub fn forget(&self, peer: &str, prompt_id: &str, token: u64) {
+    pub fn forget(&self, peer: &str, session_id: &str, prompt_id: &str, token: u64) {
         let mut hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (peer.to_owned(), prompt_id.to_owned());
+        let key = (peer.to_owned(), session_id.to_owned(), prompt_id.to_owned());
         if let Some(waits) = hooks.get_mut(&key) {
             waits.retain(|(t, _)| *t != token);
             if waits.is_empty() {
@@ -339,8 +345,9 @@ impl PeerAccepts {
         {
             return;
         }
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else { return };
         let Some(prompt_id) = params.get("promptId").and_then(Value::as_str) else { return };
-        let key = (peer.to_owned(), prompt_id.to_owned());
+        let key = (peer.to_owned(), session_id.to_owned(), prompt_id.to_owned());
         let waits = self.hooks.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
         for (_, hook) in waits.into_iter().flatten() {
             hook(params.clone());
@@ -382,15 +389,15 @@ mod tests {
         intent.id = "intent-1".into();
         intent.caller = Some("sender".into());
         intent.request["_meta"]["acpmux"]["forwardProjection"] = json!({"text": "hello"});
-        assert_eq!(outbox.remember_forward(intent.clone()).id, "intent-1");
+        assert_eq!(outbox.remember_forward(intent.clone()).unwrap().id, "intent-1");
         intent.id = "unused-retry-id".into();
-        assert_eq!(outbox.remember_forward(intent.clone()).id, "intent-1");
+        assert_eq!(outbox.remember_forward(intent.clone()).unwrap().id, "intent-1");
         intent.target = "another-target".into();
         intent.id = "intent-2".into();
-        assert_eq!(outbox.remember_forward(intent.clone()).id, "intent-2");
+        assert_eq!(outbox.remember_forward(intent.clone()).unwrap().id, "intent-2");
         intent.caller = Some("another-sender".into());
         intent.id = "intent-3".into();
-        assert_eq!(outbox.remember_forward(intent).id, "intent-3");
+        assert_eq!(outbox.remember_forward(intent).unwrap().id, "intent-3");
         assert_eq!(outbox.add(delivery(1)).id, "d-1");
     }
 
@@ -403,16 +410,53 @@ mod tests {
             let seen = seen.clone();
             accepts.wait(
                 "peer",
+                "target",
                 "p1",
                 Box::new(move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                 }),
             );
         }
-        accepts.accepted("peer", &json!({"promptId": "p1", "duplicate": true, "turnId": null}));
+        accepts.accepted(
+            "peer",
+            &json!({"sessionId": "target", "promptId": "p1", "duplicate": true, "turnId": null}),
+        );
         assert_eq!(seen.load(Ordering::SeqCst), 0);
-        accepts.accepted("peer", &json!({"promptId": "p1", "turnId": "t1"}));
+        accepts.accepted("peer", &json!({"sessionId": "target", "promptId": "p1", "turnId": "t1"}));
         assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn peer_acceptance_is_scoped_to_its_target_session() {
+        let accepts = PeerAccepts::default();
+        let seen = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        for target in ["a", "b"] {
+            let seen = seen.clone();
+            accepts.wait(
+                "peer",
+                target,
+                "same-prompt",
+                Box::new(move |_| {
+                    seen.lock().unwrap().push(target);
+                }),
+            );
+        }
+        accepts.accepted(
+            "peer",
+            &json!({"sessionId": "a", "promptId": "same-prompt", "turnId": "t-a"}),
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["a"]);
+        // An unrelated peer also cannot consume the second target's hook.
+        accepts.accepted(
+            "other-peer",
+            &json!({"sessionId": "b", "promptId": "same-prompt", "turnId": "t-b"}),
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["a"]);
+        accepts.accepted(
+            "peer",
+            &json!({"sessionId": "b", "promptId": "same-prompt", "turnId": "t-b"}),
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["a", "b"]);
     }
 
     /// Sends from many tasks at once share writes, and the file still holds every one of them

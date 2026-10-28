@@ -87,6 +87,60 @@ mod message_recovery_tests {
         assert!(sender.meta().updated_at >= sender_updated);
         assert!(receiver.meta().updated_at >= receiver_updated);
     }
+
+    #[tokio::test]
+    async fn digest_message_recovery_rebuilds_nested_projection_once() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_agent.py");
+        let mut config: Config = serde_json::from_value(json!({
+            "harnesses": {"fake": {"argv": ["python3", fake]}},
+            "defaultHarness": "fake",
+            "permissionPolicy": "approve-all"
+        }))
+        .expect("config");
+        config.store.mode = StoreMode::Memory;
+        let store = crate::store::open(&config.store, Path::new("/nonexistent")).expect("store");
+        let hub = Hub::new(config, store);
+        let make = |name: &str| NewRequest {
+            name: Some(name.into()),
+            cwd: Some(std::env::temp_dir()),
+            policy: Some(PermissionPolicy::ApproveAll),
+            ..NewRequest::default()
+        };
+        let sender = hub.new_session(make("sender")).await.expect("sender");
+        let receiver = hub.new_session(make("receiver")).await.expect("receiver");
+        let sender_id = sender.id.clone();
+        let receiver_id = receiver.id.clone();
+        let original = json!({
+            "kind": "session_message",
+            "from": sender_id,
+            "fromName": "sender",
+            "to": receiver_id,
+            "_acpmuxMessage": {
+                "sender": {"name": "sender", "sessionId": sender.id, "host": "local"},
+                "text": "joined hello",
+                "messageId": "digest-delivery-1",
+                "at": 1234,
+                "recordSenderCopy": true
+            }
+        });
+        let digest = json!({
+            "kind": "agent_digest",
+            "messages": [{"promptId": "joined-prompt", "from": "sender", "provenance": original}]
+        });
+        // A started digest has no queued record; its user_message is the only durable recovery
+        // source when the daemon stops before the acceptance callback writes projections.
+        hub.append(
+            &receiver,
+            "mux",
+            "user_message",
+            json!({"promptId": "digest-prompt", "_meta": {"provenance": digest}}),
+        );
+
+        recover_message_events(&hub, &receiver);
+        recover_message_events(&hub, &receiver);
+        assert_eq!(message_count(&hub, &receiver_id), 1);
+        assert_eq!(message_count(&hub, &sender_id), 1);
+    }
 }
 
 /// Internal durable copy of a message projection. It lives beside the existing
@@ -160,9 +214,7 @@ pub(super) fn recover_message_events(hub: &Hub, session: &Arc<Session>) {
     let kinds = ["queued", "user_message"];
     let _ = hub.store.scan_kinds(&session.id, &kinds, &mut |record| {
         let Some(provenance) = record.msg.pointer("/_meta/provenance") else { return true };
-        if let Some(message) = message_context_from_provenance(provenance) {
-            pending.push(message);
-        }
+        collect_message_contexts(provenance, &mut pending);
         true
     });
     for message in pending {
@@ -184,6 +236,21 @@ pub(super) fn recover_message_events(hub: &Hub, session: &Arc<Session>) {
                 message.message_id,
                 message.at,
             );
+        }
+    }
+}
+
+/// A digest user message carries each joined prompt's original provenance one level down. Keep
+/// recovery aligned with the live acceptance path, which records every joined message separately.
+fn collect_message_contexts(provenance: &Value, pending: &mut Vec<MessageContext>) {
+    if let Some(message) = message_context_from_provenance(provenance) {
+        pending.push(message);
+    }
+    if let Some(messages) = provenance.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(nested) = message.get("provenance") {
+                collect_message_contexts(nested, pending);
+            }
         }
     }
 }

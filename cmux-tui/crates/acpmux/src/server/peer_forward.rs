@@ -344,6 +344,7 @@ async fn forward_inner(
             let forward_intent = forward_intent.clone();
             hub.peer_accepts.wait(
                 &peer.name,
+                &id,
                 prompt_id,
                 Box::new(move |mut v| {
                     let stored =
@@ -415,7 +416,7 @@ async fn forward_inner(
             }
         }
         if let (Some(prompt_id), Some(token)) = (&accept, token) {
-            hub.peer_accepts.forget(&peer.name, prompt_id, token);
+            hub.peer_accepts.forget(&peer.name, &id, prompt_id, token);
         }
         // `Peer::request` already took the peer's display lines out of the result and the error.
         let mut result = result.map_err(|e| {

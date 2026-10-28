@@ -174,7 +174,10 @@ pub(super) async fn remember_forward(
         created_at: now,
         updated_at: now,
     };
-    Ok(hub.outbox.remember_forward(intent).id)
+    hub.outbox
+        .remember_forward(intent)
+        .map(|delivery| delivery.id)
+        .map_err(|e| RpcError::internal(format!("cannot persist peer message intent: {e:#}")))
 }
 
 /// Find a receiver projection across every page, including messages still queued
@@ -551,6 +554,44 @@ mod forward_projection_tests {
         .unwrap();
         config.store.mode = mode;
         config
+    }
+
+    #[tokio::test]
+    async fn forward_intent_requires_successful_persistence_even_on_retry() {
+        let dir = std::env::temp_dir().join(format!("forward-write-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A regular file in the parent path injects a deterministic write failure,
+        // including when the tests run as a user that can bypass file permissions.
+        let blocked_parent = dir.join("blocked");
+        std::fs::write(&blocked_parent, b"block").unwrap();
+        let path = blocked_parent.join("outbox.json");
+        let config = config(StoreMode::Memory);
+        let hub = Hub::new(config.clone(), crate::store::open(&config.store, &dir).unwrap());
+        hub.outbox.open(&path);
+        let request = json!({"sessionId": "receiver", "text": "hello", "_meta": {"acpmux": {
+            "promptId": "write-failure", "messageId": "message-write-failure",
+            "messageSender": {"name": "sender", "sessionId": "sender"}
+        }}});
+        let error = remember_forward(&hub, "remote", "receiver", "sender", &request)
+            .await
+            .expect_err("a peer request must not proceed without its durable intent");
+        assert!(error.message.contains("cannot persist peer message intent"));
+        assert!(
+            remember_forward(&hub, "remote", "receiver", "sender", &request).await.is_err(),
+            "an existing in-memory intent must not bypass the failed write"
+        );
+        std::fs::remove_file(&blocked_parent).unwrap();
+        std::fs::create_dir(&blocked_parent).unwrap();
+        let id = remember_forward(&hub, "remote", "receiver", "sender", &request)
+            .await
+            .expect("retry succeeds once the intent can be persisted");
+        let reopened = crate::hub::outbox::Outbox::default();
+        let pending = reopened.open(&path);
+        assert_eq!(pending.len(), 1, "retries preserve one durable intent");
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].prompt_id(), "write-failure");
+        assert!(pending[0].projection_only());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
