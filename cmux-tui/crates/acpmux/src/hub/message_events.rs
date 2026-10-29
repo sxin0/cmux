@@ -203,7 +203,7 @@ fn append_or_repair(
     target_scope: Option<&str>,
 ) {
     let Some(session) = resolve_exact(hub, session_id) else { return };
-    if !hub.append_message_event(
+    if !hub.append_message_event_scoped(
         &session,
         message.sender.clone(),
         message.text.clone(),
@@ -236,6 +236,7 @@ fn schedule_projection_repair(
     let message_id = message.message_id.clone();
     let at = message.at;
     let hub = hub.clone();
+    let target_scope = target_scope.map(str::to_owned);
     let guard = ProjectionRepairGuard { hub: hub.clone(), key: key.clone() };
     tokio::spawn(async move {
         // Constructed before spawning so cancellation before the future is first polled still
@@ -244,13 +245,13 @@ fn schedule_projection_repair(
         for delay in super::outbox::RETRY_DELAYS_SECS {
             tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
             let Some(session) = resolve_exact(&hub, &key.0) else { return };
-            if hub.append_message_event(
+            if hub.append_message_event_scoped(
                 &session,
                 sender.clone(),
                 text.clone(),
                 message_id.clone(),
                 at,
-                target_scope,
+                target_scope.as_deref(),
             ) {
                 return;
             }

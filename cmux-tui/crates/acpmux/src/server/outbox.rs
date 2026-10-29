@@ -199,7 +199,7 @@ async fn reconcile_forward(hub: &Arc<Hub>, delivery: &Delivery) -> Result<Value,
             intent["text"].as_str().unwrap_or_default().to_owned(),
             intent["messageId"].as_str().unwrap_or_default().to_owned(),
             delivery.updated_at,
-            target,
+            &target,
         ) {
             return Ok(accepted.clone());
         }
@@ -234,7 +234,7 @@ async fn reconcile_forward(hub: &Arc<Hub>, delivery: &Delivery) -> Result<Value,
                     intent["text"].as_str().unwrap_or_default().to_owned(),
                     intent["messageId"].as_str().unwrap_or_default().to_owned(),
                     msg["at"].as_u64().unwrap_or_else(crate::store::now_ms),
-                    target,
+                    &target,
                 ) {
                     return Err((
                         "cannot persist sender message projection".to_owned(),
