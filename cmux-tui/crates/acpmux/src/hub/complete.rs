@@ -118,7 +118,7 @@ impl Hub {
         env: &BTreeMap<String, String>,
         codex: &CodexUserConfig,
     ) -> Option<String> {
-        let models = self.models_catalog().await;
+        let models = self.all_harness_models().await;
         let live: Option<Vec<String>> =
             self.live_models_for(name).map(|list| list.into_iter().map(|m| m.id).collect());
         match recipe {

@@ -168,6 +168,14 @@ fn picker_models(reported: &[(String, String)], models: &[Value]) -> Vec<String>
     top
 }
 
+/// Whether a picker leaves out the profile `name`: the discovered `cmux` profile (Claude Code on
+/// the cmux model router) is Claude's automatic fallback, not an agent to pick. It showed as a
+/// "Cmux" harness above Claude Code (user, 2026-10-28). A `cmux` profile the person wrote in
+/// their own config is listed.
+fn picker_hidden(cfg: &crate::config::Config, name: &str) -> bool {
+    name == crate::config::CMUX_ROUTER_PROFILE && cfg.discovered.contains(name)
+}
+
 /// The harness-level catalog fields a picker shows.
 fn harness_catalog_json(curated: &CatalogHarness) -> Value {
     let mut v = json!({"id": curated.id, "name": curated.name, "brand": curated.brand, "families": curated.families, "modelSource": curated.model_source});
@@ -180,8 +188,21 @@ fn harness_catalog_json(curated: &CatalogHarness) -> Value {
 }
 
 impl Hub {
-    /// Every configured harness with the models known for it, and the catalog in use.
+    /// The `_acpmux/models` reply: every harness a picker offers, with the models known for it,
+    /// and the catalog in use. Leaves out a profile that exists only as another harness's
+    /// automatic fallback (``picker_hidden``).
     pub async fn models_catalog(&self) -> Value {
+        let mut reply = self.all_harness_models().await;
+        let cfg = self.config.read().await;
+        if let Some(list) = reply["harnesses"].as_array_mut() {
+            list.retain(|h| h["harness"].as_str().is_none_or(|name| !picker_hidden(&cfg, name)));
+        }
+        reply
+    }
+
+    /// Every configured harness with the models known for it, and the catalog in use, picker
+    /// hidden ones included (model lookups for a session already running on one).
+    pub async fn all_harness_models(&self) -> Value {
         let cfg = self.config.read().await;
         let known = self.known_models.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let refused = self.refused_models.lock().unwrap_or_else(PoisonError::into_inner).clone();
@@ -334,6 +355,7 @@ mod picker_models_tests {
             "the router stays Claude's fallback"
         );
         assert_eq!(names(&hub.models_catalog().await), vec!["claude"]);
+        assert!(names(&hub.all_harness_models().await).contains(&"cmux".to_owned()));
     }
 
     /// A `cmux` profile the person wrote in their config is theirs to pick.
