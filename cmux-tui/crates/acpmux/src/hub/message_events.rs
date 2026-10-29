@@ -90,9 +90,9 @@ pub(super) fn recover_message_events(hub: &Arc<Hub>, session: &Arc<Session>) {
         true
     });
     for message in pending {
-        append_or_repair(hub, &session.id, &message);
+        append_or_repair(hub, &session.id, &message, None);
         if message.record_sender_copy && message.sender_session != session.id {
-            append_or_repair(hub, &message.sender_session, &message);
+            append_or_repair(hub, &message.sender_session, &message, Some(&session.id));
         }
     }
 }
@@ -190,13 +190,18 @@ pub(super) fn record_message_context(
     target_session: &str,
     message: &MessageContext,
 ) {
-    append_or_repair(hub, target_session, message);
+    append_or_repair(hub, target_session, message, None);
     if message.record_sender_copy && message.sender_session != target_session {
-        append_or_repair(hub, &message.sender_session, message);
+        append_or_repair(hub, &message.sender_session, message, Some(target_session));
     }
 }
 
-fn append_or_repair(hub: &Arc<Hub>, session_id: &str, message: &MessageContext) {
+fn append_or_repair(
+    hub: &Arc<Hub>,
+    session_id: &str,
+    message: &MessageContext,
+    target_scope: Option<&str>,
+) {
     let Some(session) = resolve_exact(hub, session_id) else { return };
     if !hub.append_message_event(
         &session,
@@ -204,16 +209,23 @@ fn append_or_repair(hub: &Arc<Hub>, session_id: &str, message: &MessageContext) 
         message.text.clone(),
         message.message_id.clone(),
         message.at,
+        target_scope,
     ) {
-        schedule_projection_repair(hub, session_id, message);
+        schedule_projection_repair(hub, session_id, message, target_scope);
     }
 }
 
-fn schedule_projection_repair(hub: &Arc<Hub>, session_id: &str, message: &MessageContext) {
+fn schedule_projection_repair(
+    hub: &Arc<Hub>,
+    session_id: &str,
+    message: &MessageContext,
+    target_scope: Option<&str>,
+) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    let key = (session_id.to_owned(), message.message_id.clone());
+    let key =
+        (session_id.to_owned(), format!("{}\0{}", target_scope.unwrap_or(""), message.message_id));
     let inserted =
         hub.message_repairs.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone());
     if !inserted {
@@ -238,6 +250,7 @@ fn schedule_projection_repair(hub: &Arc<Hub>, session_id: &str, message: &Messag
                 text.clone(),
                 message_id.clone(),
                 at,
+                target_scope,
             ) {
                 return;
             }
@@ -252,7 +265,11 @@ struct ProjectionRepairGuard {
 
 impl Drop for ProjectionRepairGuard {
     fn drop(&mut self) {
-        self.hub.message_repairs.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        self.hub
+            .message_repairs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(self.key.0.clone(), self.key.1.clone()));
     }
 }
 
@@ -381,6 +398,46 @@ mod message_recovery_tests {
         recover_message_events(&hub, &receiver);
         assert_eq!(message_count(&hub, &receiver_id), 1);
         assert_eq!(message_count(&hub, &sender_id), 1);
+    }
+
+    #[tokio::test]
+    async fn sender_copies_with_same_prompt_id_keep_distinct_targets() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_agent.py");
+        let mut config: Config = serde_json::from_value(json!({
+            "harnesses": {"fake": {"argv": ["python3", fake]}},
+            "defaultHarness": "fake", "permissionPolicy": "approve-all"
+        }))
+        .expect("config");
+        config.store.mode = StoreMode::Memory;
+        let store = crate::store::open(&config.store, Path::new("/nonexistent")).expect("store");
+        let hub = Hub::new(config, store);
+        let sender = hub
+            .new_session(NewRequest {
+                name: Some("sender".into()),
+                cwd: Some(std::env::temp_dir()),
+                ..NewRequest::default()
+            })
+            .await
+            .expect("sender");
+        let sender_id = sender.id.clone();
+        let sender_meta = json!({"name": "sender", "sessionId": sender_id});
+        assert!(hub.append_message_event_scoped(
+            &sender,
+            sender_meta.clone(),
+            "to b".into(),
+            "same-prompt".into(),
+            1,
+            Some("b")
+        ));
+        assert!(hub.append_message_event_scoped(
+            &sender,
+            sender_meta,
+            "to c".into(),
+            "same-prompt".into(),
+            2,
+            Some("c")
+        ));
+        assert_eq!(message_count(&hub, &sender.id), 2);
     }
 
     #[tokio::test]

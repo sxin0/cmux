@@ -282,6 +282,48 @@ async fn send_queue_acks_at_once_and_status_reports_the_delivery() {
     }
 }
 
+/// Sender copies keep distinct target scopes when clients reuse one prompt id.
+#[tokio::test]
+async fn same_prompt_id_to_two_peer_targets_keeps_both_sender_copies() {
+    let (a, b, lane) = busy_peer("scoped-dedupe", "lane").await;
+    let mut person = C::new(a.clone()).await;
+    let sender = person
+        .call(
+            method::SESSION_NEW,
+            json!({"cwd": std::env::temp_dir(), "mcpServers": [],
+            "_meta": {"acpmux": {"name": "scoped-sender"}}}),
+        )
+        .await
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut b_client = C::new(b).await;
+    let other = b_client
+        .call(
+            method::SESSION_NEW,
+            json!({"cwd": std::env::temp_dir(), "mcpServers": [],
+            "_meta": {"acpmux": {"name": "other-target"}}}),
+        )
+        .await
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut from = C::as_session(a, &sender).await;
+    for target in [format!("b/{lane}"), format!("b/{other}")] {
+        from.send(method::SESSION_PROMPT, prompt(&target, "same id", "same-prompt")).await;
+        from.notified(method::MUX_PROMPT_ACCEPTED, Duration::from_secs(20), |p| {
+            p["promptId"] == "same-prompt"
+        })
+        .await
+        .expect("target accepted");
+    }
+    let copies = person.message_events(&sender).await;
+    assert_eq!(copies.len(), 2, "{copies:#?}");
+    assert!(copies.iter().all(|event| event["messageId"] == "same-prompt"));
+}
+
 /// Two connections retrying one message share a receiver acceptance but each hears it.
 /// That fan-out must still leave exactly one outgoing and one incoming journal copy.
 #[tokio::test]
