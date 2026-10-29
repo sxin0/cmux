@@ -54,6 +54,8 @@ struct MultiWindowRestoreTests {
                 // Window 3: a second space opened in a new window (Open Space in New Window's path).
                 let connection = try #require(before.daemon.connection)
                 let room = try await connection.createProfile(name: "mw-room")
+                // The reply comes before the app's mirror of the room; a person's space already exists.
+                await before.machines.local.store.mirrored(profile: room.id)
                 let thirdID = UUID().uuidString.lowercased()
                 before.windows.state(for: thirdID).enterProfile(room.id)
                 let thirdWorkspace = try await before.windows.createWorkspace(WorkspaceSpawn(profile: room.id), into: thirdID, frame: frames[2])
