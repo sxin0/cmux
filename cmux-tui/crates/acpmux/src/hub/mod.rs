@@ -1052,18 +1052,6 @@ impl Hub {
         message_id: String,
         at: u64,
     ) -> bool {
-        self.append_message_event_scoped(session, sender, text, message_id, at, None)
-    }
-
-    pub(super) fn append_message_event_scoped(
-        &self,
-        session: &Session,
-        sender: Value,
-        text: String,
-        message_id: String,
-        at: u64,
-        target_scope: Option<&str>,
-    ) -> bool {
         #[cfg(test)]
         if self
             .message_projection_failures
@@ -1080,9 +1068,6 @@ impl Hub {
             "at": at,
             "messageId": message_id,
         });
-        if let Some(target) = target_scope {
-            msg["_acpmuxTarget"] = json!(target);
-        }
         tool_paths::add_canonical_paths(session, "_acpmux/message", &mut msg);
         let _order = session.append_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.catch_up_locked(session);
@@ -1096,12 +1081,7 @@ impl Hub {
             if let Err(error) =
                 self.store.scan_kinds(&session.id, &["_acpmux/message"], &mut |record| {
                     if let Some(id) = record.msg.get("messageId").and_then(Value::as_str) {
-                        let key = record
-                            .msg
-                            .get("_acpmuxTarget")
-                            .and_then(Value::as_str)
-                            .map_or_else(|| id.to_owned(), |target| format!("{target}\0{id}"));
-                        ids.insert(key);
+                        ids.insert(id.to_owned());
                     }
                     true
                 })
@@ -1112,15 +1092,13 @@ impl Hub {
             *index = Some(ids);
         }
         let Some(ids) = index.as_mut() else { return false };
-        let key = target_scope
-            .map_or_else(|| message_id.clone(), |target| format!("{target}\0{message_id}"));
-        if ids.contains(&key) {
+        if ids.contains(&message_id) {
             return true;
         }
         // The payload retains the acceptance time; the journal records when this
         // copy was appended, so recovering an old message cannot regress activity.
         if self.append_at_locked(session, "mux", "_acpmux/message", msg, None, None).1 {
-            ids.insert(key);
+            ids.insert(message_id);
             true
         } else {
             false
@@ -1135,19 +1113,11 @@ impl Hub {
         text: String,
         message_id: String,
         at: u64,
-        target_session: &str,
     ) -> bool {
         if let Ok(session) = self.resolve(sender_session)
             && session.id == sender_session
         {
-            self.append_message_event_scoped(
-                &session,
-                sender,
-                text,
-                message_id,
-                at,
-                Some(target_session),
-            )
+            self.append_message_event(&session, sender, text, message_id, at)
         } else {
             false
         }
