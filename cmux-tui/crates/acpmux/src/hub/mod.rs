@@ -1044,6 +1044,7 @@ impl Hub {
 
     /// Persist one session-to-session message projection. The journal containing the copy is
     /// named by `session`; the payload keeps that id too so clients can route a replayed event.
+    #[cfg(test)]
     pub(super) fn append_message_event(
         &self,
         session: &Session,

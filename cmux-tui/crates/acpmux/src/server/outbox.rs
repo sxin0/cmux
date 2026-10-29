@@ -189,9 +189,6 @@ async fn reconcile_forward(hub: &Arc<Hub>, delivery: &Delivery) -> Result<Value,
         .ok()
         .filter(|s| s.id == caller)
         .ok_or_else(|| ("the message sender no longer exists".to_owned(), Next::Fail))?;
-    let (peer, target, _) = hub
-        .resolve_remote(&delivery.target)
-        .ok_or_else(|| ("the message receiver is not reachable yet".to_owned(), Next::Retry))?;
     if let Some(accepted) = &delivery.accepted {
         if hub.append_sender_message_event(
             &source.id,
@@ -199,12 +196,15 @@ async fn reconcile_forward(hub: &Arc<Hub>, delivery: &Delivery) -> Result<Value,
             intent["text"].as_str().unwrap_or_default().to_owned(),
             intent["messageId"].as_str().unwrap_or_default().to_owned(),
             delivery.updated_at,
-            &target,
+            delivery.target.split_once('/').map(|(_, target)| target).unwrap_or(&delivery.target),
         ) {
             return Ok(accepted.clone());
         }
         return Err(("cannot persist sender message projection".into(), Next::Retry));
     }
+    let (peer, target, _) = hub
+        .resolve_remote(&delivery.target)
+        .ok_or_else(|| ("the message receiver is not reachable yet".to_owned(), Next::Retry))?;
     let mut after = 0;
     loop {
         let page = peer

@@ -80,7 +80,7 @@ pub(super) fn restore_message_options(opts: &mut PromptOptions, provenance: Opti
 
 /// Rebuild message projections that were not appended before a daemon stopped
 /// after persisting a prompt or queue record. The append path deduplicates by
-/// `messageId`, so this is safe to run on every log load.
+/// `messageId` and the outgoing target scope, so this is safe on every log load.
 pub(super) fn recover_message_events(hub: &Arc<Hub>, session: &Arc<Session>) {
     let mut pending = Vec::new();
     let kinds = ["queued", "user_message"];
