@@ -59,7 +59,9 @@ extension SidebarListViewComponents {
             if let row = layout.row(for: key) {
                 let target = frame(for: row)
                 view.targetSize = target.size
-                if key == .group(id) { configure(view, row: row, animated: animate) } // the chevron, count and activity
+                // The chevron, count and activity. The chevron turns on every fold of the user's own, also an opening
+                // whose new rows show at once (`ui.animations.newWorkspace` off): Lawrence msg 15763.
+                if key == .group(id) { configure(view, row: row, animated: model.followsUserIntent) }
                 targets.append((view, target))
                 continue
             }
