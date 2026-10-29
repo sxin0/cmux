@@ -286,4 +286,60 @@ mod picker_models_tests {
             .map(|(id, name)| (id.to_owned(), name.to_owned()));
         assert_eq!(picker_models(&reported, &models), vec!["existing", "new-family"]);
     }
+
+    /// A hub with Claude Code, the discovered cmux router profile, and `extra`.
+    fn router_hub(extra: Option<(&str, bool)>) -> std::sync::Arc<Hub> {
+        use crate::config::{Config, StoreMode};
+        let mut found = BTreeMap::new();
+        crate::config::add_cmux_router(&mut found, &|_| Some("/usr/bin/claude".into()));
+        let claude = HarnessProfile {
+            env: BTreeMap::new(),
+            description: None,
+            models: vec![],
+            model: None,
+            ..found["cmux"].clone()
+        };
+        let mut cfg = Config::default();
+        cfg.harnesses.insert("claude".into(), claude.clone());
+        if let Some((name, discovered)) = extra {
+            if discovered {
+                cfg.join_discovered(found);
+            } else {
+                cfg.harnesses.insert(name.into(), claude);
+            }
+        }
+        cfg.store.mode = StoreMode::Memory;
+        let store = crate::store::open(&cfg.store, std::path::Path::new("/nonexistent")).unwrap();
+        Hub::new(cfg, store)
+    }
+
+    fn names(reply: &Value) -> Vec<String> {
+        reply["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["harness"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The discovered `cmux` profile is Claude's automatic fallback to the
+    /// cmux model router, not an agent a person picks: the picker showed it
+    /// as a "Cmux" harness above Claude Code (user, 2026-10-28).
+    #[tokio::test]
+    async fn the_discovered_cmux_router_fallback_is_not_a_picker_harness() {
+        let hub = router_hub(Some(("cmux", true)));
+        assert_eq!(
+            hub.config.read().await.harnesses["claude"].fallback.as_deref(),
+            Some("cmux"),
+            "the router stays Claude's fallback"
+        );
+        assert_eq!(names(&hub.models_catalog().await), vec!["claude"]);
+    }
+
+    /// A `cmux` profile the person wrote in their config is theirs to pick.
+    #[tokio::test]
+    async fn a_user_written_cmux_profile_stays_in_the_picker() {
+        let hub = router_hub(Some(("cmux", false)));
+        assert_eq!(names(&hub.models_catalog().await), vec!["claude", "cmux"]);
+    }
 }
