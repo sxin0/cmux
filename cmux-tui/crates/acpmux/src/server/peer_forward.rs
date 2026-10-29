@@ -356,6 +356,7 @@ async fn forward_inner(
                                 text,
                                 message_id,
                                 crate::store::now_ms(),
+                                &id,
                             )
                         } else {
                             false
@@ -413,6 +414,7 @@ async fn forward_inner(
                                 text,
                                 message_id,
                                 crate::store::now_ms(),
+                                &id,
                             )
                         } else {
                             false
