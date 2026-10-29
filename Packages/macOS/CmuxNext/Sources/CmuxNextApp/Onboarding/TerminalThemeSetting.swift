@@ -23,6 +23,8 @@ final class TerminalThemeSetting {
     private struct State: Equatable {
         var theme: String?
         var edits = ThemeEdits.none
+        /// `appearance.highlightColor`: the terminal's `selection-background`, so the whole app's.
+        var highlight: String?
         var font: GhosttyRuntime.FontOverride
         var background: WindowBackgroundOverride
         /// `appearance.surfaces.terminal` is set: surfaces draw a
@@ -41,6 +43,7 @@ final class TerminalThemeSetting {
                       background: ReducedBackgroundsSetting.drawn(snapshot.windowBackground, reduced: snapshot.reducedBackgrounds),
                       terminalOverridden: snapshot.surfaceBackgrounds.overridesTerminal)
             edits = snapshot.themeEdits
+            highlight = snapshot.highlightColor
         }
     }
 
@@ -194,6 +197,7 @@ final class TerminalThemeSetting {
     private static func set(_ state: State) {
         GhosttyRuntime.themeOverride = state.theme
         GhosttyRuntime.themeEdits = state.edits
+        GhosttyRuntime.highlightOverride = state.highlight
         GhosttyRuntime.fontOverride = state.font
         let family = state.font.family?.trimmingCharacters(in: .whitespaces) ?? ""
         DesignSettings.shared.terminalFontFamily = family.isEmpty ? nil : family

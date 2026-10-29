@@ -162,6 +162,19 @@ public final class GhosttyRuntime {
     /// the theme they edit (`themeLines`). Set it, then call `reloadConfig()`.
     public static var themeEdits = ThemeEdits.none
 
+    /// `appearance.highlightColor` (`#rrggbb`): the app's one highlight color, loaded after the
+    /// theme and its edits as `selection-background`, so it wins in every terminal (a space,
+    /// workspace or terminal theme too) and reaches the chrome and pages through the config's
+    /// selection color (`ThemeBridge`). Nil keeps the theme's. Set it, then call `reloadConfig()`.
+    public static var highlightOverride: String?
+
+    /// `selection-background = <color>` for a `#rrggbb` override; empty for nil or anything else,
+    /// so no other config line can be injected.
+    public nonisolated static func highlightLines(_ color: String?) -> [String] {
+        guard let color, ThemeEdits.isColor(color) else { return [] }
+        return ["selection-background = \(color.lowercased())"]
+    }
+
     /// The light/dark side `themeLines` takes from a pair, as the app's
     /// color scheme last was (`applyColorScheme`).
     static var colorSchemeIsDark = false
@@ -201,7 +214,7 @@ public final class GhosttyRuntime {
             loadDefaultFiles(into: config)
         }
         ghostty_config_load_recursive_files(config)
-        for line in themeLines(theme ?? themeOverride, isDark: colorSchemeIsDark, edits: themeEdits) {
+        for line in themeLines(theme ?? themeOverride, isDark: colorSchemeIsDark, edits: themeEdits) + highlightLines(highlightOverride) {
             line.withCString { ghostty_config_load_string(config, $0, UInt(line.utf8.count), "cmux.json") }
         }
         for line in fontOverrideLines(fontOverride) {
