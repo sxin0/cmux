@@ -4365,7 +4365,7 @@
     },
     "tabs.barPosition" : {
       "default" : "top",
-      "description" : "Where each pane's tab bar sits. Bottom also shows the standard title bar, so the window buttons never cover a pane.",
+      "description" : "Where each pane's tab bar sits. At the bottom, the panes reach the top of the window; the window buttons never cover a pane.",
       "enum" : [
         "top",
         "bottom"

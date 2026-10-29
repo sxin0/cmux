@@ -267,7 +267,7 @@
 			<key>pfm_default</key>
 			<string>top</string>
 			<key>pfm_description</key>
-			<string>Where each pane's tab bar sits. Bottom also shows the standard title bar, so the window buttons never cover a pane.</string>
+			<string>Where each pane's tab bar sits. At the bottom, the panes reach the top of the window; the window buttons never cover a pane.</string>
 			<key>pfm_name</key>
 			<string>tabs.barPosition</string>
 			<key>pfm_range_list</key>

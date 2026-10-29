@@ -2763,7 +2763,7 @@
       },
       "help" : {
         "key" : "settings.tabs.barPosition.help",
-        "text" : "Where each pane's tab bar sits. Bottom also shows the standard title bar, so the window buttons never cover a pane."
+        "text" : "Where each pane's tab bar sits. At the bottom, the panes reach the top of the window; the window buttons never cover a pane."
       },
       "kept_on_reset_all" : false,
       "key" : "tabs.barPosition",
