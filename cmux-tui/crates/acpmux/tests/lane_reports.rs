@@ -393,8 +393,18 @@ async fn session_message_without_prompt_id_records_both_journal_copies() {
         assert!(reply.get("error").is_none(), "{reply}");
         let replayed: Vec<_> = notes
             .iter()
-            .filter(|note| note["method"] == "_acpmux/message")
-            .map(|note| &note["params"])
+            .filter_map(|note| {
+                if note["method"] == "_acpmux/message" {
+                    Some(&note["params"])
+                } else if note["method"] == "_acpmux/event"
+                    && note["params"]["kind"] == "_acpmux/message"
+                {
+                    assert!(note["params"]["seq"].as_u64().is_some_and(|seq| seq > 0));
+                    Some(&note["params"]["msg"])
+                } else {
+                    None
+                }
+            })
             .collect();
         let expected = if origin == Origin::Peer { &redacted } else { &incoming[0] };
         assert_eq!(replayed, vec![expected], "{origin:?}: {notes:#?}");

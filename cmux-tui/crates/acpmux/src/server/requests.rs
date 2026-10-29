@@ -1091,7 +1091,17 @@ async fn dispatch_request(
                         json!({"sessionId": s.id, "update": {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": text}}, "_meta": {"acpmux": {"seq": rec.seq, "at": rec.at, "replay": true}}}),
                     ));
                 } else if rec.dir == "mux" && rec.kind == "_acpmux/message" {
-                    conn.send(&Message::notification(method::MUX_MESSAGE, rec.msg.clone()));
+                    // A peer connection must receive the event envelope so its hub can
+                    // retain the sequence and replay it after reconnect. Person/app clients
+                    // keep the compact message notification they already consume.
+                    if conn.origin == super::Origin::Peer {
+                        conn.send(&Message::notification(
+                            method::MUX_EVENT,
+                            super::event_value(&s.id, rec),
+                        ));
+                    } else {
+                        conn.send(&Message::notification(method::MUX_MESSAGE, rec.msg.clone()));
+                    }
                 } else if rec.dir == "in"
                     && !rec.kind.ends_with(".replay")
                     && rec.msg.get("method").and_then(Value::as_str) == Some(method::SESSION_UPDATE)

@@ -83,12 +83,25 @@ pub(super) fn restore_message_options(opts: &mut PromptOptions, provenance: Opti
 /// `messageId` and the outgoing target scope, so this is safe on every log load.
 pub(super) fn recover_message_events(hub: &Arc<Hub>, session: &Arc<Session>) {
     let mut pending = Vec::new();
-    let kinds = ["queued", "user_message"];
-    let _ = hub.store.scan_kinds(&session.id, &kinds, &mut |record| {
-        let Some(provenance) = record.msg.pointer("/_meta/provenance") else { return true };
-        collect_message_contexts(provenance, &mut pending);
-        true
-    });
+    // A fork copies historical `user_message` records before its `forked` marker. Those records
+    // describe the parent's delivery and must never recreate a sender-side copy in the child.
+    // Stay conservative if a crash left no marker: skip the inherited prefix entirely.
+    let mut inherited = session.meta().fork_seq.is_some();
+    let _ =
+        hub.store.scan_kinds(&session.id, &["queued", "user_message", "forked"], &mut |record| {
+            if inherited {
+                if record.kind == "forked" {
+                    inherited = false;
+                }
+                return true;
+            }
+            if !matches!(record.kind.as_str(), "queued" | "user_message") {
+                return true;
+            }
+            let Some(provenance) = record.msg.pointer("/_meta/provenance") else { return true };
+            collect_message_contexts(provenance, &mut pending);
+            true
+        });
     for message in pending {
         append_or_repair(hub, &session.id, &message, None);
         if message.record_sender_copy && message.sender_session != session.id {
@@ -494,5 +507,63 @@ mod message_recovery_tests {
         .await
         .expect("sender projection repair timed out");
         assert_eq!(message_count(&hub, &sender_id), 1);
+    }
+
+    #[tokio::test]
+    async fn forked_historical_user_messages_do_not_recreate_sender_copies() {
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_agent.py");
+        let mut config: Config = serde_json::from_value(json!({
+            "harnesses": {"fake": {"argv": ["python3", fake]}},
+            "defaultHarness": "fake",
+            "permissionPolicy": "approve-all"
+        }))
+        .expect("config");
+        config.store.mode = StoreMode::Memory;
+        let store = crate::store::open(&config.store, Path::new("/nonexistent")).expect("store");
+        let hub = Hub::new(config, store);
+        let make = |name: &str| NewRequest {
+            name: Some(name.into()),
+            cwd: Some(std::env::temp_dir()),
+            policy: Some(PermissionPolicy::ApproveAll),
+            ..NewRequest::default()
+        };
+        let sender = hub.new_session(make("sender")).await.expect("sender");
+        let child = hub.new_session(make("child")).await.expect("child");
+        child.meta.lock().unwrap().parent_id = Some("parent".into());
+        child.meta.lock().unwrap().fork_seq = Some(1);
+        let provenance = json!({
+            "kind": "session_message",
+            "from": sender.id,
+            "fromName": "sender",
+            "to": child.id,
+            "_acpmuxMessage": {
+                "sender": {"name": "sender", "sessionId": sender.id, "host": "local"},
+                "text": "inherited",
+                "messageId": "historical-delivery",
+                "at": 1234,
+                "recordSenderCopy": true
+            }
+        });
+        hub.append(
+            &child,
+            "mux",
+            "user_message",
+            json!({"promptId": "historical", "_meta": {"provenance": provenance.clone()}}),
+        );
+        hub.append(&child, "mux", "forked", json!({"parentId": "parent", "forkSeq": 1}));
+        recover_message_events(&hub, &child);
+        assert_eq!(message_count(&hub, &child.id), 0);
+        assert_eq!(message_count(&hub, &sender.id), 0);
+
+        // New child traffic after the fork marker remains recoverable and gets both projections.
+        hub.append(
+            &child,
+            "mux",
+            "user_message",
+            json!({"promptId": "current", "_meta": {"provenance": provenance}}),
+        );
+        recover_message_events(&hub, &child);
+        assert_eq!(message_count(&hub, &child.id), 1);
+        assert_eq!(message_count(&hub, &sender.id), 1);
     }
 }
