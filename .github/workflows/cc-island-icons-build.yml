@@ -11,6 +11,14 @@ on:
         required: false
         default: ""
         type: string
+      configuration:
+        description: Native app build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
       tag:
         description: Isolated development build tag (lowercase letters, digits, hyphens)
         required: true
@@ -33,6 +41,7 @@ jobs:
         shell: bash
     env:
       BUILD_TAG: ${{ inputs.tag }}
+      BUILD_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
       CMUX_DEV_BACKEND_MODE: local
       CMUX_SKIP_ZIG_BUILD: "1"
       CMUX_RELOAD_NO_GLOBAL_CLI_LINKS: "1"
@@ -126,11 +135,11 @@ jobs:
           path: |
             ${{ runner.temp }}/cc-island-derived-data
             ${{ runner.temp }}/cc-island-source-packages
-          key: cc-island-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
+          key: cc-island-native-v2-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
           restore-keys: |
-            cc-island-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
+            cc-island-native-v2-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
 
-      - name: Build tagged Debug app and bundled CLI without launching
+      - name: Build tagged app and bundled CLI without launching
         id: build
         timeout-minutes: 180
         env:
@@ -138,7 +147,9 @@ jobs:
           CMUX_SOURCE_PACKAGES_DIR: ${{ runner.temp }}/cc-island-source-packages
         run: |
           set -euo pipefail
-          ./scripts/reload.sh --tag "$BUILD_TAG" \
+          build_flags=()
+          if [[ "$BUILD_CONFIGURATION" == Release ]]; then build_flags+=(--release); fi
+          ./scripts/reload.sh --tag "$BUILD_TAG" "${build_flags[@]}" \
             --derived-data "$RUNNER_TEMP/cc-island-derived-data" \
             --swift-frontend-workaround \
             2>&1 | tee "$RUNNER_TEMP/cc-island-icons/logs/reload-console.log"
@@ -150,14 +161,14 @@ jobs:
         id: archive
         run: |
           set -euo pipefail
-          app="$RUNNER_TEMP/cc-island-derived-data/Build/Products/Debug/cmux DEV $BUILD_TAG.app"
+          app="$RUNNER_TEMP/cc-island-derived-data/Build/Products/$BUILD_CONFIGURATION/cmux DEV $BUILD_TAG.app"
           test -d "$app"
           test -x "$app/Contents/Resources/bin/cmux"
           source scripts/lib/mobile-attach.sh
           expected_bundle="$(cmux_attach_mac_bundle_id "$BUILD_TAG")"
           actual_bundle="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
           [[ "$actual_bundle" == "$expected_bundle" ]]
-          DYLD_FRAMEWORK_PATH="$app/Contents/Frameworks:$RUNNER_TEMP/cc-island-derived-data/Build/Products/Debug" \
+          DYLD_FRAMEWORK_PATH="$app/Contents/Frameworks:$RUNNER_TEMP/cc-island-derived-data/Build/Products/$BUILD_CONFIGURATION" \
             "$app/Contents/Resources/bin/cmux" --help \
             > "$RUNNER_TEMP/cc-island-icons/logs/cli-help.txt"
           ditto -c -k --sequesterRsrc --keepParent "$app" \
@@ -172,8 +183,20 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/Library/Developer/Xcode/DerivedData"
           ln -s "$RUNNER_TEMP/cc-island-derived-data" "$HOME/Library/Developer/Xcode/DerivedData/cmux-$BUILD_TAG"
-          ./scripts/launch-tagged-automation.sh "$BUILD_TAG" --wait-socket 30 \
-            2>&1 | tee "$RUNNER_TEMP/cc-island-icons/logs/multi-tab-launch.log"
+          if [[ "$BUILD_CONFIGURATION" == Release ]]; then
+            app="$RUNNER_TEMP/cc-island-derived-data/Build/Products/Release/cmux DEV $BUILD_TAG.app"
+            env -u CMUX_SOCKET -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_SOCKET_PASSWORD \
+              CMUX_SOCKET_PATH="/tmp/cmux-debug-$BUILD_TAG.sock" CMUX_SOCKET_MODE=automation \
+              CMUX_DISABLE_SESSION_RESTORE=1 open -g "$app"
+            for attempt in {1..150}; do
+              [[ -S "/tmp/cmux-debug-$BUILD_TAG.sock" ]] && break
+              sleep 0.2
+            done
+            test -S "/tmp/cmux-debug-$BUILD_TAG.sock"
+          else
+            ./scripts/launch-tagged-automation.sh "$BUILD_TAG" --wait-socket 30 \
+              2>&1 | tee "$RUNNER_TEMP/cc-island-icons/logs/multi-tab-launch.log"
+          fi
           CMUX_SOCKET_PATH="/tmp/cmux-debug-$BUILD_TAG.sock" \
             python3 -I tests_v2/test_surface_icon_multiple_tabs.py \
             2>&1 | tee "$RUNNER_TEMP/cc-island-icons/logs/multi-tab-regression.log"
@@ -231,7 +254,7 @@ jobs:
               "build_outcome": os.environ["BUILD_OUTCOME"],
               "archive_outcome": os.environ["ARCHIVE_OUTCOME"],
               "app_tests": "Not run: focused package tests only; app build does not compile cmuxTests.",
-              "distribution": "Tagged ad-hoc-signed Debug app; not notarized or a release.",
+              "distribution": "Tagged ad-hoc-signed " + os.environ["BUILD_CONFIGURATION"] + " app; not notarized or an official release.",
           }, __import__("sys").stdout, indent=2)
           PY
           {
@@ -240,7 +263,7 @@ jobs:
             printf -- '- Bundled CLI is inside the app artifact; compiler/test logs are separate.\n'
             printf -- '- Local backend mode; no backend server or authenticated session is provisioned.\n'
             printf -- '- Focused package tests only; app-level cmuxTests are not compiled or executed.\n'
-            printf -- '- Tagged ad-hoc Debug app, not notarized; no release is published.\n'
+            printf -- '- Tagged ad-hoc app, not notarized; no official release is published.\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload tagged app and bundled CLI even if subsequent tests fail
@@ -260,7 +283,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cc-island-derived-data
             ${{ runner.temp }}/cc-island-source-packages
-          key: cc-island-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
+          key: cc-island-native-v2-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
 
       - name: Upload build and focused-test logs on success or failure
         if: ${{ always() }}
