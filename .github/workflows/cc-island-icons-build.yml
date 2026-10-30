@@ -41,6 +41,7 @@ jobs:
         shell: bash
     env:
       BUILD_TAG: ${{ inputs.tag }}
+      CMUX_BUILD_ARCH: arm64
       BUILD_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
       CMUX_DEV_BACKEND_MODE: local
       CMUX_SKIP_ZIG_BUILD: "1"
@@ -142,9 +143,9 @@ jobs:
           path: |
             ${{ runner.temp }}/cc-island-derived-data
             ${{ runner.temp }}/cc-island-source-packages
-          key: cc-island-native-v2-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
+          key: cc-island-native-v3-arm64-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
           restore-keys: |
-            cc-island-native-v2-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
+            cc-island-native-v3-arm64-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-
 
       - name: Build tagged app and bundled CLI without launching
         id: build
@@ -175,6 +176,10 @@ jobs:
           expected_bundle="$(cmux_attach_mac_bundle_id "$BUILD_TAG")"
           actual_bundle="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
           [[ "$actual_bundle" == "$expected_bundle" ]]
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          [[ "$(lipo -archs "$app/Contents/MacOS/$executable")" == arm64 ]]
+          [[ "$(lipo -archs "$app/Contents/Resources/bin/cmux")" == arm64 ]]
+          du -sh "$app" | tee "$RUNNER_TEMP/cc-island-icons/logs/app-size.txt"
           DYLD_FRAMEWORK_PATH="$app/Contents/Frameworks:$RUNNER_TEMP/cc-island-derived-data/Build/Products/$BUILD_CONFIGURATION" \
             "$app/Contents/Resources/bin/cmux" --help \
             > "$RUNNER_TEMP/cc-island-icons/logs/cli-help.txt"
@@ -290,7 +295,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cc-island-derived-data
             ${{ runner.temp }}/cc-island-source-packages
-          key: cc-island-native-v2-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
+          key: cc-island-native-v3-arm64-${{ inputs.configuration || 'Debug' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.xcode-version', 'cmux.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}-${{ github.run_id }}
 
       - name: Upload build and focused-test logs on success or failure
         if: ${{ always() }}

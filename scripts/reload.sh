@@ -1661,6 +1661,13 @@ XCODEBUILD_ARGS=(
   -configuration "$BUILD_CONFIGURATION"
   -destination 'platform=macOS'
 )
+# A native-only dogfood build must not inherit Release's universal ARCHS default.
+if [[ -n "${CMUX_BUILD_ARCH:-}" ]]; then
+  case "$CMUX_BUILD_ARCH" in
+    arm64|x86_64) XCODEBUILD_ARGS+=("ARCHS=$CMUX_BUILD_ARCH" ONLY_ACTIVE_ARCH=YES) ;;
+    *) echo "error: CMUX_BUILD_ARCH must be arm64 or x86_64" >&2; exit 1 ;;
+  esac
+fi
 if [[ -n "$DERIVED_DATA" ]]; then
   XCODEBUILD_ARGS+=(-derivedDataPath "$DERIVED_DATA")
 fi
