@@ -42,7 +42,17 @@ struct ControlCommandCoordinatorSurfaceIconTests {
         ))
     }
 
-    @Test func renewRequiresTokenAndStillRequiresProcessIdentity() throws {
+    @Test func fullReplacementNeedsNoPreviousCredentialsOrTTL() throws {
+        var input = params()
+        input["owner_id"] = .string("restarted-producer")
+        let replacement = try ControlSurfaceIconParser().parse(input, clear: false)
+        #expect(replacement.ownerID == "restarted-producer")
+        #expect(replacement.leaseToken == nil)
+        #expect(replacement.expectedRevision == nil)
+        #expect(replacement.asset != nil)
+    }
+
+    @Test func legacyAssetFreeUpdatePreservesAllCredentials() throws {
         var input = params()
         input.removeValue(forKey: "asset")
         #expect(throws: ControlSurfaceIconParser.Invalid.self) {
@@ -125,7 +135,7 @@ struct ControlCommandCoordinatorSurfaceIconTests {
         }
     }
 
-    @Test func acceptsTTLBoundsAndRejectsOutsideRange() throws {
+    @Test func acceptsDeprecatedTTLBoundsAndRejectsOutsideRange() throws {
         for ttl in [5, 120] {
             var input = params()
             input["ttl_seconds"] = .double(Double(ttl))
