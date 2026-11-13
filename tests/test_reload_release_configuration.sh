@@ -79,3 +79,23 @@ products="$(awk '/^[[:space:]]*BUILD_PRODUCTS_DEBUG_DIR=.*Build\/Products/ { pri
 [[ "$products" == *'$BUILD_CONFIGURATION'* || "$products" == *'${BUILD_CONFIGURATION}'* ]] \
   || fail "reload.sh still reads products from a fixed directory: $products"
 echo "PASS: products are read from the built configuration's directory"
+
+# Personal distributions can select just their host architecture without changing
+# the app identity or weakening Release optimization.
+for arch in arm64 x86_64; do
+  CMUX_BUILD_ARCH="$arch" CMUX_RELOAD_APP_EMIT_MODULE=1 \
+    run_reload --tag "$TAG" --build-only --derived-data "$TMP_DIR/dd" --release
+  [[ -f "$ARGS" ]] || fail "the $arch build never reached xcodebuild: $OUTPUT"
+  grep -qx "ARCHS=$arch" "$ARGS" || fail "CMUX_BUILD_ARCH=$arch did not select ARCHS"
+  grep -qx 'ONLY_ACTIVE_ARCH=YES' "$ARGS" || fail "the selected architecture was not isolated"
+  ! grep -q 'CMUX_RELOAD_INTEGRATED_DRIVER_cmux=NO\|no-emit-module-separately' "$ARGS" \
+    || fail "explicit module emission still forced the standalone app driver"
+done
+echo "PASS: native architecture overrides reach xcodebuild with the standard module driver"
+
+CMUX_BUILD_ARCH=invalid run_reload --tag "$TAG" --build-only --derived-data "$TMP_DIR/dd" --release
+[[ ! -f "$ARGS" ]] || fail "an invalid architecture reached xcodebuild"
+[[ "$STATUS" -ne 0 ]] || fail "an invalid architecture succeeded"
+[[ "$OUTPUT" == *'CMUX_BUILD_ARCH must be arm64 or x86_64'* ]] \
+  || fail "the invalid architecture did not report the supported values: $OUTPUT"
+echo "PASS: invalid architecture overrides fail before the native build"
