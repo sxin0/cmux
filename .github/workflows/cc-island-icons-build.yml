@@ -139,7 +139,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/cc-island-icons/logs/cmux-tui-build.log"
           client="$GITHUB_WORKSPACE/cmux-tui/target/$target/release/cmux-tui"
           test -x "$client"
-          lipo -verify_arch "$native_arch" "$client"
+          lipo "$client" -verify_arch "$native_arch"
           PROBE="$("$client" remote-probe --json)" VERSION="$("$client" --version)" \
             python3 -I - <<'PY'
           import json
@@ -200,7 +200,7 @@ jobs:
             > "$RUNNER_TEMP/cc-island-icons/logs/cli-help.txt"
           logs="$RUNNER_TEMP/cc-island-icons/logs"
           client="$app/Contents/Resources/bin/cmux-tui"
-          lipo -verify_arch "$CMUX_PERSONAL_NATIVE_ARCH" "$client"
+          lipo "$client" -verify_arch "$CMUX_PERSONAL_NATIVE_ARCH"
           PROBE="$("$client" remote-probe --json)" VERSION="$("$client" --version)" \
             EXPECTED_COMMIT="$(git rev-parse HEAD)" EXPECTED_GHOSTTY="$(git -C ghostty rev-parse HEAD)" \
             python3 -I - <<'PY'
@@ -225,7 +225,7 @@ jobs:
             description="$(file -b "$binary")"
             if [[ "$description" == *Mach-O* ]]; then
               printf '%s: %s\n' "${binary#"$app"/}" "$description"
-              lipo -verify_arch "$CMUX_PERSONAL_NATIVE_ARCH" "$binary"
+              lipo "$binary" -verify_arch "$CMUX_PERSONAL_NATIVE_ARCH"
             fi
           done < "$RUNNER_TEMP/cc-island-native-files" > "$logs/native-architectures.txt"
           ditto -c -k --sequesterRsrc --keepParent "$app" \
