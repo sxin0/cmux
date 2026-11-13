@@ -56,6 +56,11 @@ All notable changes to cmux are documented here.
 - Worktree setup no longer copies a symlink that points outside the repository ([#21627](https://github.com/manaflow-ai/cmux/pull/21627))
 - The app inside the DMG is stapled, so it opens offline ([#21217](https://github.com/manaflow-ai/cmux/pull/21217))
 
+## [0.65.2.2] - 2026-10-27
+
+### Fixed
+- cmux no longer trusts four leaked emSign (eMudhra) root certificates for its own network connections; it checks certificates against the macOS trust store ([#25452](https://github.com/manaflow-ai/cmux/issues/25452))
+
 ## [0.65.2] - 2026-10-14
 
 ### Changed
